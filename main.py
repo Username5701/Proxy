@@ -49,63 +49,77 @@ async def proxy_stream(request: Request, hash: str, sign: str, t: str):
         logger.info(f"Range request: {range_header}")
 
     try:
-        async with httpx.AsyncClient(
-            http2=True,
-            timeout=120.0,
-            follow_redirects=True,
-            verify=False,
-        ) as client:
-            resp = await client.get(video_url, headers=headers)
+        # Try HTTP/2 first
+        try:
+            async with httpx.AsyncClient(
+                http2=True,
+                timeout=120.0,
+                follow_redirects=True,
+                verify=False,
+            ) as client:
+                resp = await client.get(video_url, headers=headers)
+                logger.info(f"HTTP/2 response: {resp.status_code}")
+        except Exception as e:
+            logger.warning(f"HTTP/2 failed: {e}, falling back to HTTP/1.1")
+            # Fallback to HTTP/1.1
+            async with httpx.AsyncClient(
+                http2=False,
+                timeout=120.0,
+                follow_redirects=True,
+                verify=False,
+            ) as client:
+                resp = await client.get(video_url, headers=headers)
+                logger.info(f"HTTP/1.1 response: {resp.status_code}")
 
-            logger.info(f"CDN response status: {resp.status_code}")
+        # Handle errors
+        if resp.status_code == 429:
+            logger.warning("Rate limited by CDN")
+            raise HTTPException(status_code=429, detail="CDN rate limit exceeded")
 
-            if resp.status_code == 429:
-                raise HTTPException(status_code=429, detail="Rate limited")
+        if resp.status_code == 426:
+            logger.warning("HTTP/2 upgrade required, using HTTP/1.1")
+            async with httpx.AsyncClient(
+                http2=False,
+                timeout=120.0,
+                follow_redirects=True,
+                verify=False,
+            ) as client:
+                resp = await client.get(video_url, headers=headers)
+                logger.info(f"HTTP/1.1 response: {resp.status_code}")
 
-            if resp.status_code == 426:
-                logger.warning("HTTP/2 failed, trying HTTP/1.1...")
-                async with httpx.AsyncClient(
-                    http2=False,
-                    timeout=120.0,
-                    follow_redirects=True,
-                    verify=False,
-                ) as client2:
-                    resp = await client2.get(video_url, headers=headers)
-                    logger.info(f"Fallback response: {resp.status_code}")
+        if resp.status_code not in [200, 206]:
+            logger.error(f"CDN error: {resp.status_code}")
+            raise HTTPException(status_code=resp.status_code, detail=f"CDN error: {resp.status_code}")
 
-            if resp.status_code not in [200, 206]:
-                logger.error(f"CDN error: {resp.status_code}")
-                raise HTTPException(status_code=resp.status_code, detail=f"CDN error: {resp.status_code}")
+        content_type = resp.headers.get("content-type", "video/mp4")
+        content_length = resp.headers.get("content-length", "")
+        content_range = resp.headers.get("content-range", "")
 
-            content_type = resp.headers.get("content-type", "video/mp4")
-            content_length = resp.headers.get("content-length", "")
-            content_range = resp.headers.get("content-range", "")
+        response_headers = {
+            "Content-Type": content_type,
+            "Accept-Ranges": "bytes",
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "public, max-age=3600",
+        }
 
-            response_headers = {
-                "Content-Type": content_type,
-                "Accept-Ranges": "bytes",
-                "Access-Control-Allow-Origin": "*",
-                "Cache-Control": "public, max-age=3600",
-            }
+        if resp.status_code == 206:
+            response_headers["Content-Range"] = content_range
+            status_code = 206
+        else:
+            response_headers["Content-Disposition"] = f"inline; filename=video_{hash}.mp4"
+            status_code = 200
 
-            if resp.status_code == 206:
-                response_headers["Content-Range"] = content_range
-                status_code = 206
-            else:
-                response_headers["Content-Disposition"] = f"inline; filename=video_{hash}.mp4"
-                status_code = 200
+        if content_length:
+            response_headers["Content-Length"] = content_length
 
-            if content_length:
-                response_headers["Content-Length"] = content_length
+        logger.info(f"Streaming: {content_length} bytes, status: {status_code}")
 
-            logger.info(f"Streaming: {content_length} bytes, status: {status_code}")
-
-            return StreamingResponse(
-                resp.aiter_bytes(chunk_size=8192),
-                status_code=status_code,
-                media_type=content_type,
-                headers=response_headers,
-            )
+        return StreamingResponse(
+            resp.aiter_bytes(chunk_size=8192),
+            status_code=status_code,
+            media_type=content_type,
+            headers=response_headers,
+        )
 
     except httpx.TimeoutException:
         logger.error("CDN timeout")
