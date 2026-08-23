@@ -3,7 +3,11 @@ from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import os
-from urllib.parse import urlparse, parse_qs
+import logging
+
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="MovieBox Proxy", description="Stream video from CDN via IPv6")
 
@@ -20,7 +24,6 @@ async def root():
     return {
         "service": "MovieBox Proxy",
         "status": "running",
-        "ipv6": "enabled",
         "usage": "/stream?hash=...&sign=...&t=..."
     }
 
@@ -28,10 +31,10 @@ async def root():
 async def proxy_stream(hash: str, sign: str, t: str):
     """
     Proxy the video stream from the CDN.
-    Supports range requests for seeking.
     """
     # Reconstruct the CDN URL
     video_url = f"https://bcdnxw.hakunaymatata.com/bt/{hash}.mp4?sign={sign}&t={t}"
+    logger.info(f"Fetching: {video_url}")
     
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -44,17 +47,23 @@ async def proxy_stream(hash: str, sign: str, t: str):
     
     async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
         try:
-            # Make the request
+            logger.info("Making request to CDN...")
             resp = await client.get(video_url, headers=headers)
             
+            logger.info(f"CDN response status: {resp.status_code}")
+            
             if resp.status_code == 429:
+                logger.warning("Rate limited by CDN")
                 raise HTTPException(status_code=429, detail="CDN rate limit exceeded")
             
             if resp.status_code != 200:
+                logger.error(f"CDN error: {resp.status_code}")
                 raise HTTPException(status_code=resp.status_code, detail=f"CDN error: {resp.status_code}")
             
             content_length = resp.headers.get("content-length", "")
             content_type = resp.headers.get("content-type", "video/mp4")
+            
+            logger.info(f"Streaming video: {content_length} bytes")
             
             return StreamingResponse(
                 resp.aiter_bytes(chunk_size=8192),
@@ -69,8 +78,10 @@ async def proxy_stream(hash: str, sign: str, t: str):
             )
             
         except httpx.TimeoutException:
+            logger.error("CDN timeout")
             raise HTTPException(status_code=504, detail="CDN timeout")
         except Exception as e:
+            logger.error(f"Error: {str(e)}")
             raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
