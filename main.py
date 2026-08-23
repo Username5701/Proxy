@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-import httpx
+import requests
 import os
 import logging
 
@@ -28,7 +28,7 @@ async def root():
 @app.get("/stream")
 async def proxy_stream(request: Request, hash: str, sign: str, t: str):
     """
-    Proxy video stream from CDN using HTTP/2.
+    Proxy video stream from CDN using requests.
     """
     video_url = f"https://bcdnxw.hakunaymatata.com/bt/{hash}.mp4?sign={sign}&t={t}"
     logger.info(f"Fetching: {video_url}")
@@ -49,31 +49,28 @@ async def proxy_stream(request: Request, hash: str, sign: str, t: str):
         logger.info(f"Range request: {range_header}")
 
     try:
-        # Try HTTP/2 with verify=False
-        async with httpx.AsyncClient(
-            http2=True,
-            timeout=120.0,
-            follow_redirects=True,
-            verify=False,  # Disable SSL verification
-        ) as client:
-            resp = await client.get(video_url, headers=headers)
-            logger.info(f"HTTP/2 response: {resp.status_code}")
+        # Use requests with stream=True
+        resp = requests.get(video_url, headers=headers, stream=True, timeout=120)
+
+        logger.info(f"Response status: {resp.status_code}")
 
         if resp.status_code == 426:
-            logger.error("HTTP/2 upgrade required but not available")
-            raise HTTPException(status_code=426, detail="HTTP/2 upgrade required")
+            # Try using a different User-Agent
+            logger.warning("426 Upgrade Required, trying different User-Agent...")
+            headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            resp = requests.get(video_url, headers=headers, stream=True, timeout=120)
+            logger.info(f"Retry response: {resp.status_code}")
 
         if resp.status_code == 429:
             logger.warning("Rate limited by CDN")
             raise HTTPException(status_code=429, detail="CDN rate limit exceeded")
 
-        if resp.status_code not in [200, 206]:
+        if resp.status_code != 200:
             logger.error(f"CDN error: {resp.status_code}")
             raise HTTPException(status_code=resp.status_code, detail=f"CDN error: {resp.status_code}")
 
         content_type = resp.headers.get("content-type", "video/mp4")
         content_length = resp.headers.get("content-length", "")
-        content_range = resp.headers.get("content-range", "")
 
         response_headers = {
             "Content-Type": content_type,
@@ -82,28 +79,17 @@ async def proxy_stream(request: Request, hash: str, sign: str, t: str):
             "Cache-Control": "public, max-age=3600",
         }
 
-        if resp.status_code == 206:
-            response_headers["Content-Range"] = content_range
-            status_code = 206
-        else:
-            response_headers["Content-Disposition"] = f"inline; filename=video_{hash}.mp4"
-            status_code = 200
-
         if content_length:
             response_headers["Content-Length"] = content_length
 
-        logger.info(f"Streaming: {content_length} bytes, status: {status_code}")
+        logger.info(f"Streaming: {content_length} bytes")
 
         return StreamingResponse(
-            resp.aiter_bytes(chunk_size=8192),
-            status_code=status_code,
+            resp.iter_content(chunk_size=8192),
+            status_code=200,
             media_type=content_type,
             headers=response_headers,
         )
-
-    except httpx.TimeoutException:
-        logger.error("CDN timeout")
-        raise HTTPException(status_code=504, detail="CDN timeout")
 
     except Exception as e:
         logger.error(f"Error: {str(e)}")
