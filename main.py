@@ -28,7 +28,7 @@ async def root():
 @app.get("/stream")
 async def proxy_stream(request: Request, hash: str, sign: str, t: str):
     """
-    Proxy video stream from CDN.
+    Proxy video stream from CDN using HTTP/2.
     """
     video_url = f"https://bcdnxw.hakunaymatata.com/bt/{hash}.mp4?sign={sign}&t={t}"
     logger.info(f"Fetching: {video_url}")
@@ -49,43 +49,23 @@ async def proxy_stream(request: Request, hash: str, sign: str, t: str):
         logger.info(f"Range request: {range_header}")
 
     try:
-        # Try HTTP/2 first
-        try:
-            async with httpx.AsyncClient(
-                http2=True,
-                timeout=120.0,
-                follow_redirects=True,
-                verify=False,
-            ) as client:
-                resp = await client.get(video_url, headers=headers)
-                logger.info(f"HTTP/2 response: {resp.status_code}")
-        except Exception as e:
-            logger.warning(f"HTTP/2 failed: {e}, falling back to HTTP/1.1")
-            # Fallback to HTTP/1.1
-            async with httpx.AsyncClient(
-                http2=False,
-                timeout=120.0,
-                follow_redirects=True,
-                verify=False,
-            ) as client:
-                resp = await client.get(video_url, headers=headers)
-                logger.info(f"HTTP/1.1 response: {resp.status_code}")
+        # Try HTTP/2 with verify=False
+        async with httpx.AsyncClient(
+            http2=True,
+            timeout=120.0,
+            follow_redirects=True,
+            verify=False,  # Disable SSL verification
+        ) as client:
+            resp = await client.get(video_url, headers=headers)
+            logger.info(f"HTTP/2 response: {resp.status_code}")
 
-        # Handle errors
+        if resp.status_code == 426:
+            logger.error("HTTP/2 upgrade required but not available")
+            raise HTTPException(status_code=426, detail="HTTP/2 upgrade required")
+
         if resp.status_code == 429:
             logger.warning("Rate limited by CDN")
             raise HTTPException(status_code=429, detail="CDN rate limit exceeded")
-
-        if resp.status_code == 426:
-            logger.warning("HTTP/2 upgrade required, using HTTP/1.1")
-            async with httpx.AsyncClient(
-                http2=False,
-                timeout=120.0,
-                follow_redirects=True,
-                verify=False,
-            ) as client:
-                resp = await client.get(video_url, headers=headers)
-                logger.info(f"HTTP/1.1 response: {resp.status_code}")
 
         if resp.status_code not in [200, 206]:
             logger.error(f"CDN error: {resp.status_code}")
