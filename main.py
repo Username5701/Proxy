@@ -49,12 +49,11 @@ async def proxy_stream(request: Request, hash: str, sign: str, t: str):
         logger.info(f"Range request: {range_header}")
 
     try:
-        # Use httpx with HTTP/2 and SSL verification disabled
         async with httpx.AsyncClient(
             http2=True,
             timeout=120.0,
             follow_redirects=True,
-            verify=False,  # Disable SSL verification
+            verify=False,
         ) as client:
             resp = await client.get(video_url, headers=headers)
 
@@ -64,7 +63,6 @@ async def proxy_stream(request: Request, hash: str, sign: str, t: str):
                 raise HTTPException(status_code=429, detail="Rate limited")
 
             if resp.status_code == 426:
-                # Try without HTTP/2 (fallback)
                 logger.warning("HTTP/2 failed, trying HTTP/1.1...")
                 async with httpx.AsyncClient(
                     http2=False,
@@ -115,7 +113,6 @@ async def proxy_stream(request: Request, hash: str, sign: str, t: str):
 
     except Exception as e:
         logger.error(f"Error: {str(e)}")
-        # Return the error as a response instead of crashing
         raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
