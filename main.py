@@ -17,6 +17,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Create a global HTTP/2 client
+# This ensures HTTP/2 is always used
+http_client = httpx.AsyncClient(
+    http2=True,
+    timeout=httpx.Timeout(120.0),
+    follow_redirects=True,
+    verify=False,  # Disable SSL verification if needed
+)
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info("Starting HTTP/2 client...")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await http_client.aclose()
+
 @app.get("/")
 async def root():
     return {
@@ -28,8 +45,7 @@ async def root():
 @app.get("/stream")
 async def proxy_stream(request: Request, hash: str, sign: str, t: str):
     """
-    Proxy video stream from CDN with seeking support.
-    Uses chunked streaming (no buffering).
+    Proxy video stream from CDN with HTTP/2 support.
     """
     # Reconstruct the CDN URL
     video_url = f"https://bcdnxw.hakunaymatata.com/bt/{hash}.mp4?sign={sign}&t={t}"
@@ -43,6 +59,7 @@ async def proxy_stream(request: Request, hash: str, sign: str, t: str):
         "Accept-Encoding": "gzip, deflate, br",
         "Accept-Language": "en-US,en;q=0.9",
         "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
     }
 
     # Handle range requests (for seeking)
@@ -51,67 +68,70 @@ async def proxy_stream(request: Request, hash: str, sign: str, t: str):
         cdn_headers["Range"] = range_header
         logger.info(f"Range request: {range_header}")
 
-    async with httpx.AsyncClient(http2=True, timeout=120.0, follow_redirects=True) as client:
-        try:
-            # Fetch from CDN
-            resp = await client.get(video_url, headers=cdn_headers)
+    try:
+        # Use the global HTTP/2 client
+        resp = await http_client.get(video_url, headers=cdn_headers)
 
-            # Handle errors
-            if resp.status_code == 429:
-                logger.warning("Rate limited by CDN")
-                raise HTTPException(status_code=429, detail="CDN rate limit exceeded")
+        # Handle errors
+        if resp.status_code == 429:
+            logger.warning("Rate limited by CDN")
+            raise HTTPException(status_code=429, detail="CDN rate limit exceeded")
 
-            if resp.status_code == 426:
-                logger.warning("HTTP/2 upgrade required")
-                raise HTTPException(status_code=426, detail="HTTP/2 upgrade required")
+        if resp.status_code == 426:
+            logger.error("HTTP/2 upgrade required — check httpx installation")
+            # Try one more time with explicit HTTP/2
+            async with httpx.AsyncClient(http2=True, timeout=120.0) as client:
+                resp = await client.get(video_url, headers=cdn_headers)
+                if resp.status_code == 426:
+                    raise HTTPException(status_code=426, detail="HTTP/2 upgrade required")
 
-            if resp.status_code not in [200, 206]:
-                logger.error(f"CDN error: {resp.status_code}")
-                raise HTTPException(status_code=resp.status_code, detail=f"CDN error: {resp.status_code}")
+        if resp.status_code not in [200, 206]:
+            logger.error(f"CDN error: {resp.status_code}")
+            raise HTTPException(status_code=resp.status_code, detail=f"CDN error: {resp.status_code}")
 
-            # Get response headers
-            content_type = resp.headers.get("content-type", "video/mp4")
-            content_length = resp.headers.get("content-length", "")
-            content_range = resp.headers.get("content-range", "")
+        # Get response headers
+        content_type = resp.headers.get("content-type", "video/mp4")
+        content_length = resp.headers.get("content-length", "")
+        content_range = resp.headers.get("content-range", "")
 
-            # Build response headers
-            response_headers = {
-                "Content-Type": content_type,
-                "Accept-Ranges": "bytes",
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-                "Access-Control-Allow-Headers": "Range, Content-Type",
-                "Cache-Control": "public, max-age=3600",
-            }
+        # Build response headers
+        response_headers = {
+            "Content-Type": content_type,
+            "Accept-Ranges": "bytes",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+            "Access-Control-Allow-Headers": "Range, Content-Type",
+            "Cache-Control": "public, max-age=3600",
+        }
 
-            # Set status code and headers based on response
-            if resp.status_code == 206:
-                response_headers["Content-Range"] = content_range
-                status_code = 206
-            else:
-                response_headers["Content-Disposition"] = f"inline; filename=video_{hash}.mp4"
-                status_code = 200
+        # Set status code and headers based on response
+        if resp.status_code == 206:
+            response_headers["Content-Range"] = content_range
+            status_code = 206
+        else:
+            response_headers["Content-Disposition"] = f"inline; filename=video_{hash}.mp4"
+            status_code = 200
 
-            if content_length:
-                response_headers["Content-Length"] = content_length
+        if content_length:
+            response_headers["Content-Length"] = content_length
 
-            logger.info(f"Streaming: {content_length} bytes, status: {status_code}")
+        logger.info(f"Streaming: {content_length} bytes, status: {status_code}")
 
-            # Stream directly without buffering
-            return StreamingResponse(
-                resp.aiter_bytes(chunk_size=8192),
-                status_code=status_code,
-                media_type=content_type,
-                headers=response_headers,
-            )
+        # Stream directly without buffering
+        return StreamingResponse(
+            resp.aiter_bytes(chunk_size=8192),
+            status_code=status_code,
+            media_type=content_type,
+            headers=response_headers,
+        )
 
-        except httpx.TimeoutException:
-            logger.error("CDN timeout")
-            raise HTTPException(status_code=504, detail="CDN timeout")
+    except httpx.TimeoutException:
+        logger.error("CDN timeout")
+        raise HTTPException(status_code=504, detail="CDN timeout")
 
-        except Exception as e:
-            logger.error(f"Error: {str(e)}")
-            raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
