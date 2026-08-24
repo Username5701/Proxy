@@ -33,7 +33,6 @@ async def proxy_stream(request: Request, hash: str, sign: str, t: str):
     video_url = f"https://bcdnxw.hakunaymatata.com/bt/{hash}.mp4?sign={sign}&t={t}"
     logger.info(f"Fetching: {video_url}")
 
-    # Headers to mimic a real browser
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": "https://movieboxonline.net/",
@@ -44,7 +43,6 @@ async def proxy_stream(request: Request, hash: str, sign: str, t: str):
         "Upgrade-Insecure-Requests": "1",
     }
 
-    # Handle range requests (for seeking)
     range_header = request.headers.get("range")
     if range_header:
         headers["Range"] = range_header
@@ -52,17 +50,15 @@ async def proxy_stream(request: Request, hash: str, sign: str, t: str):
 
     try:
         async with httpx.AsyncClient(
-            http2=True,
             timeout=120.0,
             follow_redirects=True,
-            verify=False,  # Disable SSL verification
+            verify=False,
         ) as client:
             resp = await client.get(video_url, headers=headers)
             logger.info(f"CDN response status: {resp.status_code}")
 
             if resp.status_code == 403:
                 logger.warning("403 Forbidden - trying with different headers...")
-                # Try with different User-Agent
                 headers["User-Agent"] = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Mobile Safari/537.36"
                 resp = await client.get(video_url, headers=headers)
                 logger.info(f"Retry response: {resp.status_code}")
@@ -74,7 +70,6 @@ async def proxy_stream(request: Request, hash: str, sign: str, t: str):
             if resp.status_code == 426:
                 logger.warning("HTTP/2 upgrade required, using HTTP/1.1")
                 async with httpx.AsyncClient(
-                    http2=False,
                     timeout=120.0,
                     follow_redirects=True,
                     verify=False,
