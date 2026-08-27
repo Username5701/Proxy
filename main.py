@@ -22,7 +22,7 @@ async def root():
     return {"service": "MovieBox Proxy", "status": "running"}
 
 @app.get("/stream")
-async def proxy_stream(hash: str, sign: str, t: str):
+async def proxy_stream(request: Request, hash: str, sign: str, t: str):
     """
     Proxy video stream from CDN.
     """
