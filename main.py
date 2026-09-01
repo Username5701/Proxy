@@ -1,4 +1,4 @@
-# main.py - Complete Railway proxy with MP4 and HLS support
+# main.py - Complete fixed version
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,7 +7,9 @@ import re
 import json
 import logging
 import os
-from urllib.parse import unquote, urlparse
+from urllib.parse import unquote, urlparse, quote
+import time
+import base64
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,7 +23,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# HTTP/2 client for CDN requests
+# HTTP/2 client
 client = httpx.AsyncClient(
     http2=True,
     timeout=httpx.Timeout(120.0, connect=30.0),
@@ -37,7 +39,6 @@ async def get_fresh_token():
     """Get fresh token from the API with caching"""
     global cached_token, token_expiry
     
-    import time
     now = time.time()
     
     if cached_token and token_expiry > now:
@@ -68,7 +69,6 @@ async def get_fresh_token():
                 return token
             else:
                 logger.error("No token found in Set-Cookie header")
-                logger.info(f"Response headers: {dict(resp.headers)}")
                 return None
                 
     except Exception as e:
@@ -84,7 +84,6 @@ async def build_headers(range_header=None):
     # Extract userId from token
     userId = "5449878944034578072"
     try:
-        import base64
         payload = json.loads(base64.b64decode(token.split('.')[1] + '==').decode('utf-8'))
         userId = str(payload.get('uid', userId))
     except Exception as e:
@@ -126,8 +125,7 @@ async def root():
         "status": "running",
         "endpoints": {
             "/proxy": "Proxy MP4 or HLS video stream",
-            "/hls": "Proxy HLS playlist with rewritten segments",
-            "/segment": "Proxy HLS segment"
+            "/hls": "Proxy HLS playlist with rewritten segments"
         },
         "usage": "/proxy?url=ENCODED_CDN_URL  or  /hls?hash=...&sign=...&t=..."
     }
@@ -153,6 +151,8 @@ async def proxy(request: Request, url: str):
         # Default: MP4 video
         return await handle_mp4(decoded_url, request)
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Proxy error: {str(e)}")
         raise HTTPException(500, f"Proxy error: {str(e)}")
@@ -162,7 +162,7 @@ async def handle_mp4(video_url: str, request: Request):
     try:
         headers = await build_headers(request.headers.get("range"))
         
-        logger.info(f"Sending MP4 request with token: {headers['Authorization'][:20]}...")
+        logger.info(f"Sending MP4 request")
         
         resp = await client.get(video_url, headers=headers)
         logger.info(f"MP4 response status: {resp.status_code}")
@@ -174,8 +174,8 @@ async def handle_mp4(video_url: str, request: Request):
                 logger.info(f"HTTP/1.1 response: {resp.status_code}")
         
         if resp.status_code != 200:
-            error_body = resp.text if hasattr(resp, 'text') else str(resp.content)
-            logger.error(f"CDN error: {resp.status_code} - {error_body[:200]}")
+            error_body = resp.text[:200] if hasattr(resp, 'text') else str(resp.content)[:200]
+            logger.error(f"CDN error: {resp.status_code} - {error_body}")
             raise HTTPException(resp.status_code, detail=f"CDN error: {resp.status_code}")
         
         content_type = resp.headers.get("content-type", "video/mp4")
@@ -230,8 +230,8 @@ async def handle_hls_playlist(playlist_url: str, request: Request):
                 logger.info(f"HTTP/1.1 response: {resp.status_code}")
         
         if resp.status_code != 200:
-            error_body = resp.text if hasattr(resp, 'text') else str(resp.content)
-            logger.error(f"HLS error: {resp.status_code} - {error_body[:200]}")
+            error_body = resp.text[:200] if hasattr(resp, 'text') else str(resp.content)[:200]
+            logger.error(f"HLS error: {resp.status_code} - {error_body}")
             raise HTTPException(resp.status_code, detail=f"HLS error: {resp.status_code}")
         
         playlist = resp.text
@@ -257,14 +257,14 @@ async def handle_hls_playlist(playlist_url: str, request: Request):
         # Full URLs (https://...)
         playlist = re.sub(
             r'(https?://[^\s]+\.ts)',
-            lambda m: f"{proxy_base}{m.group(1)}",
+            lambda m: f"{proxy_base}{quote(m.group(1), safe='')}",
             playlist
         )
         
         # Relative URLs (segment_001.ts)
         playlist = re.sub(
             r'^([a-zA-Z0-9_\-]+\.ts)$',
-            lambda m: f"{proxy_base}{base_url}{m.group(1)}",
+            lambda m: f"{proxy_base}{quote(base_url + m.group(1), safe='')}",
             playlist,
             flags=re.MULTILINE
         )
@@ -273,8 +273,6 @@ async def handle_hls_playlist(playlist_url: str, request: Request):
             "Content-Type": "application/vnd.apple.mpegurl",
             "Cache-Control": "public, max-age=300",
             "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-            "Access-Control-Allow-Headers": "Range, Content-Type",
         }
         
         return StreamingResponse(
@@ -307,8 +305,8 @@ async def handle_segment(segment_url: str, request: Request):
                 logger.info(f"HTTP/1.1 response: {resp.status_code}")
         
         if resp.status_code != 200:
-            error_body = resp.text if hasattr(resp, 'text') else str(resp.content)
-            logger.error(f"Segment error: {resp.status_code} - {error_body[:200]}")
+            error_body = resp.text[:200] if hasattr(resp, 'text') else str(resp.content)[:200]
+            logger.error(f"Segment error: {resp.status_code} - {error_body}")
             raise HTTPException(resp.status_code, detail=f"Segment error: {resp.status_code}")
         
         content_type = resp.headers.get("content-type", "video/mp4")
@@ -353,7 +351,7 @@ async def hls_direct(request: Request, hash: str, sign: str, t: str):
         raise HTTPException(400, "Missing parameters: hash, sign, t")
     
     playlist_url = f"https://live-pull.aisports.mobi/moviebox/{hash}/playlist.m3u8?sign={sign}&t={t}"
-    encoded_url = __import__('urllib.parse').quote(playlist_url)
+    encoded_url = quote(playlist_url, safe='')
     
     return await proxy(request, url=encoded_url)
 
