@@ -1,15 +1,17 @@
+# main.py
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse, Response
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
-import os
-import logging
 import re
+import json
+import logging
+from urllib.parse import unquote
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="MovieBox Proxy")
+app = FastAPI(title="MovieBox Proxy - Railway")
 
 app.add_middleware(
     CORSMiddleware,
@@ -18,152 +20,173 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# HTTP/2 client
+client = httpx.AsyncClient(
+    http2=True,
+    timeout=httpx.Timeout(120.0, connect=30.0),
+    follow_redirects=True,
+    limits=httpx.Limits(max_keepalive_connections=10, max_connections=50)
+)
+
+async def get_fresh_token():
+    """Get fresh token from the API"""
+    url = "https://h5-api.aoneroom.com/wefeed-h5api-bff/country-code"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Android 15; Mobile; rv:153.0) Gecko/153.0 Firefox/153.0",
+        "Accept": "application/json",
+        "X-Client-Info": '{"timezone":"Africa/Lagos"}',
+        "Origin": "https://movieboxonline.net",
+        "Referer": "https://movieboxonline.net/",
+    }
+    
+    try:
+        async with httpx.AsyncClient() as temp_client:
+            resp = await temp_client.get(url, headers=headers)
+            logger.info(f"Token response status: {resp.status_code}")
+            
+            # Extract token from Set-Cookie header
+            set_cookie = resp.headers.get("set-cookie", "")
+            match = re.search(r'token=([^;]+)', set_cookie)
+            
+            if match:
+                token = match.group(1)
+                logger.info(f"Token obtained: {token[:30]}...")
+                return token
+            else:
+                logger.error("No token found in Set-Cookie header")
+                logger.info(f"Response headers: {dict(resp.headers)}")
+                return None
+                
+    except Exception as e:
+        logger.error(f"Error getting token: {str(e)}")
+        return None
+
 @app.get("/")
 async def root():
-    return {"service": "MovieBox Proxy", "status": "running"}
-
-@app.get("/stream")
-async def proxy_stream(request: Request, hash: str = None, sign: str = None, t: str = None, url: str = None):
-    """
-    Proxy video stream from CDN.
-    Supports both MP4 and M3U8 (HLS) streams.
-    """
-    # If URL is provided directly, use it
-    if url:
-        video_url = url
-        logger.info(f"Fetching from URL: {video_url}")
-    else:
-        # Fallback to hash, sign, t format
-        video_url = f"https://bcdnxw.hakunaymatata.com/bt/{hash}.mp4?sign={sign}&t={t}"
-        logger.info(f"Fetching: {video_url}")
-
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://sportsnow.top/",
-        "Accept": "*/*",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
+    return {
+        "service": "MovieBox Proxy (Railway)",
+        "status": "running",
+        "endpoints": {
+            "/proxy": "Proxy video stream from CDN"
+        },
+        "usage": "/proxy?url=ENCODED_CDN_URL"
     }
 
-    range_header = request.headers.get("range")
-    if range_header:
-        headers["Range"] = range_header
-        logger.info(f"Range request: {range_header}")
+@app.get("/proxy")
+async def proxy(request: Request, url: str):
+    """Proxy video stream from CDN"""
+    if not url:
+        raise HTTPException(400, "Missing url parameter")
+    
+    try:
+        decoded_url = unquote(url)
+        logger.info(f"Fetching: {decoded_url}")
 
-    async with httpx.AsyncClient(timeout=120.0, follow_redirects=True, verify=False) as client:
+        # Get fresh token
+        token = await get_fresh_token()
+        if not token:
+            raise HTTPException(401, "Failed to get authorization token")
+
+        # Extract userId from token or use default
+        userId = "5449878944034578072"
         try:
-            resp = await client.get(video_url, headers=headers)
-            logger.info(f"CDN response status: {resp.status_code}")
+            import base64
+            payload = json.loads(base64.b64decode(token.split('.')[1] + '==').decode('utf-8'))
+            userId = str(payload.get('uid', userId))
+        except Exception as e:
+            logger.warning(f"Could not decode token: {e}")
 
-            if resp.status_code == 403:
-                logger.warning("403 Forbidden - trying with different headers...")
-                headers["User-Agent"] = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36"
-                headers["Origin"] = "https://sportsnow.top"
-                resp = await client.get(video_url, headers=headers)
-                logger.info(f"Retry response: {resp.status_code}")
+        # Build headers exactly like working browser
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Android 15; Mobile; rv:154.0) Gecko/154.0 Firefox/154.0",
+            "Accept": "video/mp4, video/webm, video/*, */*",
+            "Accept-Language": "en-US",
+            "Accept-Encoding": "gzip, deflate, br, zstd",
+            "Referer": "https://movieboxonline.net/",
+            "Origin": "https://movieboxonline.net",
+            "Connection": "keep-alive",
+            "Authorization": f"Bearer {token}",
+            "Cookie": f"token={token}",
+            "X-Client-Info": '{"timezone":"Africa/Lagos"}',
+            "X-User": json.dumps({
+                "token": token,
+                "userId": userId,
+                "userType": 0,
+                "appType": 3
+            }),
+            "X-Source": "",
+            "Sec-Fetch-Dest": "video",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": "cross-site",
+            "Upgrade-Insecure-Requests": "1",
+        }
 
-            if resp.status_code == 429:
-                logger.warning("Rate limited by CDN")
-                raise HTTPException(status_code=429, detail="CDN rate limit exceeded")
+        # Pass through Range header
+        range_header = request.headers.get("range")
+        if range_header:
+            headers["Range"] = range_header
+            logger.info(f"Range request: {range_header}")
 
-            if resp.status_code != 200:
-                logger.error(f"CDN error: {resp.status_code}")
-                raise HTTPException(status_code=resp.status_code, detail=f"CDN error: {resp.status_code}")
+        logger.info(f"Sending request with token: {token[:20]}...")
 
-            content_type = resp.headers.get("content-type", "")
-            content_length = resp.headers.get("content-length", "")
+        # Make the request
+        resp = await client.get(decoded_url, headers=headers)
+        logger.info(f"Response status: {resp.status_code}")
 
-            # Determine if it's an M3U8 playlist
-            is_m3u8 = 'm3u8' in content_type or video_url.endswith('.m3u8')
-            is_mp4 = 'mp4' in content_type or video_url.endswith('.mp4')
+        if resp.status_code == 426:
+            # Try with HTTP/1.1
+            logger.warning("426 Upgrade Required, trying HTTP/1.1...")
+            async with httpx.AsyncClient(http2=False, timeout=30.0) as http1_client:
+                resp = await http1_client.get(decoded_url, headers=headers)
+                logger.info(f"HTTP/1.1 response: {resp.status_code}")
 
-            response_headers = {
-                "Accept-Ranges": "bytes",
-                "Access-Control-Allow-Origin": "*",
-                "Cache-Control": "public, max-age=3600",
-            }
-
-            if is_m3u8:
-                # For M3U8, we need to proxy the playlist and rewrite the URLs
-                content = resp.text
-                # Rewrite relative URLs to absolute URLs
-                base_url = video_url.rsplit('/', 1)[0] + '/'
-                rewritten_content = re.sub(
-                    r'(https?://[^\s]+\.ts)',
-                    lambda m: f"{base_url}{m.group(1)}",
-                    content
-                )
-                response_headers["Content-Type"] = "application/vnd.apple.mpegurl"
-                return Response(
-                    content=rewritten_content,
-                    status_code=200,
-                    headers=response_headers
-                )
-
-            if content_length:
-                response_headers["Content-Length"] = content_length
-
-            if content_type:
-                response_headers["Content-Type"] = content_type
-
-            logger.info(f"Streaming: {content_length} bytes, type: {content_type}")
-
-            return StreamingResponse(
-                resp.aiter_bytes(chunk_size=8192),
-                status_code=200,
-                media_type=content_type or "video/mp4",
-                headers=response_headers,
+        if resp.status_code != 200:
+            error_body = resp.text if hasattr(resp, 'text') else str(resp.content)
+            logger.error(f"CDN error: {resp.status_code} - {error_body[:200]}")
+            raise HTTPException(
+                resp.status_code,
+                detail=f"CDN error: {resp.status_code} - {error_body[:100]}"
             )
 
-        except httpx.TimeoutException:
-            logger.error("CDN timeout")
-            raise HTTPException(status_code=504, detail="CDN timeout")
-        except Exception as e:
-            logger.error(f"Error: {str(e)}")
-            raise HTTPException(status_code=500, detail=str(e))
+        # Stream response
+        content_type = resp.headers.get("content-type", "video/mp4")
+        content_length = resp.headers.get("content-length", "")
+        content_range = resp.headers.get("content-range", "")
 
-# ============================================
-# PROXY FOR M3U8 SEGMENTS (TS files)
-# ============================================
-@app.get("/proxy/ts")
-async def proxy_ts(url: str):
-    """
-    Proxy individual TS segments from the M3U8 playlist.
-    """
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36",
-        "Referer": "https://sportsnow.top/",
-        "Origin": "https://sportsnow.top",
-        "Accept": "*/*",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Connection": "keep-alive",
-    }
+        response_headers = {
+            "Content-Type": content_type,
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "public, max-age=3600",
+            "Accept-Ranges": "bytes",
+        }
 
-    async with httpx.AsyncClient(timeout=120.0, follow_redirects=True, verify=False) as client:
-        try:
-            resp = await client.get(url, headers=headers)
-            if resp.status_code != 200:
-                logger.error(f"TS segment error: {resp.status_code}")
-                raise HTTPException(status_code=resp.status_code, detail=f"TS error: {resp.status_code}")
+        if content_length:
+            response_headers["Content-Length"] = content_length
+        if content_range:
+            response_headers["Content-Range"] = content_range
 
-            response_headers = {
-                "Content-Type": "video/mp2t",
-                "Access-Control-Allow-Origin": "*",
-                "Cache-Control": "public, max-age=3600",
-            }
+        logger.info(f"Streaming: {content_length} bytes")
 
-            return StreamingResponse(
-                resp.aiter_bytes(chunk_size=8192),
-                status_code=200,
-                media_type="video/mp2t",
-                headers=response_headers,
-            )
-        except Exception as e:
-            logger.error(f"TS error: {str(e)}")
-            raise HTTPException(status_code=500, detail=str(e))
+        async def stream_generator():
+            async for chunk in resp.aiter_bytes(chunk_size=8192):
+                yield chunk
+
+        return StreamingResponse(
+            stream_generator(),
+            status_code=200,
+            media_type=content_type,
+            headers=response_headers,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Proxy error: {str(e)}")
+        raise HTTPException(500, f"Proxy error: {str(e)}")
+
+@app.on_event("shutdown")
+async def shutdown():
+    await client.aclose()
 
 if __name__ == "__main__":
     import uvicorn
