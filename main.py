@@ -1,4 +1,4 @@
-# main.py - Railway proxy with proxy rotation using iplocate/free-proxy-list
+# main.py - Railway proxy with multiple proxy sources and fallbacks
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,11 +29,16 @@ app.add_middleware(
 proxy_pool = []
 last_refresh = 0
 
-# Use the raw URL for the HTTP proxy list from iplocate
-PROXY_LIST_URL = "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/http.txt"
+# Multiple proxy sources (fallback if one fails)
+PROXY_SOURCES = [
+    "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/http.txt",
+    "https://raw.githubusercontent.com/proxmint/free-proxy-list/main/proxies/http.txt",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text",
+]
 
 async def refresh_proxy_pool():
-    """Fetch fresh proxies from iplocate/free-proxy-list"""
+    """Fetch fresh proxies from multiple sources"""
     global proxy_pool, last_refresh
     
     # Don't refresh more than once every 5 minutes
@@ -41,27 +46,33 @@ async def refresh_proxy_pool():
         logger.info("Using cached proxy pool (refreshed within 5 minutes)")
         return
     
-    logger.info("🔄 Fetching fresh proxies from iplocate...")
+    logger.info("🔄 Fetching fresh proxies...")
     new_proxies = []
     
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(PROXY_LIST_URL)
-            if resp.status_code == 200:
-                lines = resp.text.strip().split('\n')
-                for line in lines:
-                    line = line.strip()
-                    if line and not line.startswith('#'):
-                        parts = line.split(':')
-                        if len(parts) == 2:
-                            proxy = f"http://{parts[0]}:{parts[1]}"
-                            if proxy not in new_proxies:
-                                new_proxies.append(proxy)
-                logger.info(f"✅ Fetched {len(new_proxies)} proxies from iplocate")
-            else:
-                logger.error(f"Failed to fetch from iplocate: {resp.status_code}")
-    except Exception as e:
-        logger.error(f"Failed to fetch from iplocate: {str(e)}")
+    for source in PROXY_SOURCES:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(source)
+                if resp.status_code == 200:
+                    content = resp.text.strip()
+                    lines = content.split('\n')
+                    count = 0
+                    for line in lines:
+                        line = line.strip()
+                        if line and not line.startswith('#'):
+                            # Handle different formats
+                            if ':' in line:
+                                parts = line.split(':')
+                                if len(parts) == 2:
+                                    proxy = f"http://{parts[0]}:{parts[1]}"
+                                    if proxy not in new_proxies:
+                                        new_proxies.append(proxy)
+                                        count += 1
+                    logger.info(f"✅ Fetched {count} proxies from {source[:50]}...")
+                else:
+                    logger.warning(f"Source returned {resp.status_code}: {source[:50]}...")
+        except Exception as e:
+            logger.warning(f"Failed to fetch from {source[:50]}...: {str(e)[:50]}")
     
     if new_proxies:
         random.shuffle(new_proxies)
@@ -69,7 +80,7 @@ async def refresh_proxy_pool():
         last_refresh = time.time()
         logger.info(f"✅ Proxy pool updated: {len(proxy_pool)} proxies")
     else:
-        logger.warning("⚠️ No proxies fetched, keeping existing pool")
+        logger.warning("⚠️ No proxies fetched from any source, keeping existing pool")
 
 async def get_proxy():
     """Get a random proxy from the pool"""
@@ -162,7 +173,7 @@ def build_headers(token, range_header=None):
 @app.on_event("startup")
 async def startup_event():
     """Pre-fill proxy pool on startup"""
-    logger.info("🔄 Pre-filling proxy pool from iplocate...")
+    logger.info("🔄 Pre-filling proxy pool...")
     await refresh_proxy_pool()
     logger.info(f"✅ Proxy pool ready: {len(proxy_pool)} proxies")
 
