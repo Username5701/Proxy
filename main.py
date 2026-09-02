@@ -1,4 +1,4 @@
-# main.py - Railway with proxy-scraper rotation
+# main.py - Railway proxy with automatic proxy rotation from public lists
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,82 +25,73 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Try to import proxy-scraper
-try:
-    from proxy_scraper import scraper
-    PROXY_SCRAPER_AVAILABLE = True
-    logger.info("✅ proxy-scraper available - using automatic proxy rotation")
-except ImportError:
-    PROXY_SCRAPER_AVAILABLE = False
-    logger.warning("⚠️ proxy-scraper not installed - falling back to direct connection")
-
-# Token cache
+# ==================== TOKEN CACHE ====================
 cached_token = None
 token_expiry = 0
 
-# Proxy pool
+# ==================== PROXY POOL ====================
 proxy_pool = []
+last_refresh = 0
 
+# Public proxy sources
+PROXY_SOURCES = [
+    "https://raw.githubusercontent.com/proxmint/free-proxy-list/main/proxies/http.txt",
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
+]
+
+# ==================== PROXY ROTATION ====================
 async def refresh_proxy_pool():
-    """Refresh proxy pool from proxy-scraper"""
-    global proxy_pool
-    if not PROXY_SCRAPER_AVAILABLE:
+    """Fetch fresh proxies from public sources"""
+    global proxy_pool, last_refresh
+    
+    # Don't refresh more than once every 5 minutes
+    if time.time() - last_refresh < 300:
+        logger.info("Using cached proxy pool (refreshed within 5 minutes)")
         return
     
-    try:
-        # Run in thread pool to avoid blocking
-        loop = asyncio.get_event_loop()
-        
-        # Get proxies from different sources
-        proxies = await loop.run_in_executor(
-            None, 
-            lambda: scraper.get_proxies(
-                protocol="http",
-                country="all",
-                anonymity="all",
-                limit=10,
-                timeout=5
-            )
-        )
-        
-        if proxies:
-            for proxy in proxies:
-                # Format: http://ip:port
-                proxy_str = f"http://{proxy.ip}:{proxy.port}"
-                if proxy_str not in proxy_pool:
-                    proxy_pool.append(proxy_str)
-            
-            # Keep only last 20 proxies
-            if len(proxy_pool) > 20:
-                proxy_pool = proxy_pool[-20:]
-            
-            logger.info(f"✅ Proxy pool refreshed: {len(proxy_pool)} proxies")
-        else:
-            logger.warning("No proxies returned from scraper")
-            
-    except Exception as e:
-        logger.error(f"Failed to get proxies: {str(e)}")
+    logger.info("🔄 Fetching fresh proxies...")
+    new_proxies = []
+    
+    for source in PROXY_SOURCES:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(source)
+                if resp.status_code == 200:
+                    lines = resp.text.strip().split('\n')
+                    for line in lines:
+                        line = line.strip()
+                        if line and not line.startswith('#'):
+                            parts = line.split(':')
+                            if len(parts) == 2:
+                                proxy = f"http://{parts[0]}:{parts[1]}"
+                                if proxy not in new_proxies:
+                                    new_proxies.append(proxy)
+            logger.info(f"✅ Fetched {len(new_proxies)} proxies from {source}")
+        except Exception as e:
+            logger.error(f"Failed to fetch from {source}: {str(e)}")
+    
+    if new_proxies:
+        random.shuffle(new_proxies)
+        proxy_pool = new_proxies[:50]
+        last_refresh = time.time()
+        logger.info(f"✅ Proxy pool updated: {len(proxy_pool)} proxies")
+    else:
+        logger.warning("⚠️ No proxies fetched, keeping existing pool")
 
 async def get_proxy():
-    """Get a proxy from the pool"""
+    """Get a random proxy from the pool"""
     global proxy_pool
     
-    if not PROXY_SCRAPER_AVAILABLE:
-        return None
-    
-    # If pool is empty, refresh
     if not proxy_pool:
         await refresh_proxy_pool()
     
-    # If still empty, return None
     if not proxy_pool:
         return None
     
-    # Get a random proxy from the pool
-    proxy = random.choice(proxy_pool)
-    
-    return proxy
+    return random.choice(proxy_pool)
 
+# ==================== TOKEN MANAGEMENT ====================
 async def get_fresh_token():
     """Get fresh token from the API"""
     global cached_token, token_expiry
@@ -172,13 +163,13 @@ def build_headers(token, range_header=None):
     
     return headers
 
+# ==================== ENDPOINTS ====================
 @app.on_event("startup")
 async def startup_event():
     """Pre-fill proxy pool on startup"""
-    if PROXY_SCRAPER_AVAILABLE:
-        logger.info("🔄 Pre-filling proxy pool...")
-        await refresh_proxy_pool()
-        logger.info(f"✅ Proxy pool ready: {len(proxy_pool)} proxies")
+    logger.info("🔄 Pre-filling proxy pool...")
+    await refresh_proxy_pool()
+    logger.info(f"✅ Proxy pool ready: {len(proxy_pool)} proxies")
 
 @app.get("/")
 async def root():
@@ -186,7 +177,6 @@ async def root():
         "service": "MovieBox Proxy (Railway)",
         "status": "running",
         "proxy_pool_size": len(proxy_pool),
-        "proxy_scraper_available": PROXY_SCRAPER_AVAILABLE,
         "endpoints": {
             "/proxy": "Proxy video stream from CDN",
             "/refresh_proxies": "Force refresh proxy pool"
@@ -196,8 +186,9 @@ async def root():
 @app.get("/refresh_proxies")
 async def refresh_proxies():
     """Force refresh the proxy pool"""
-    global proxy_pool
+    global proxy_pool, last_refresh
     proxy_pool = []
+    last_refresh = 0
     await refresh_proxy_pool()
     return {
         "status": "refreshed",
@@ -221,26 +212,40 @@ async def proxy(request: Request, url: str):
     if range_header:
         logger.info(f"Range request: {range_header}")
 
-    # Try with proxy if available, fallback to direct
-    max_attempts = 3 if PROXY_SCRAPER_AVAILABLE else 1
+    # Try proxies, then fallback to direct
+    max_attempts = 6  # 5 proxies + direct
     
     for attempt in range(max_attempts):
         proxy_url = None
-        if PROXY_SCRAPER_AVAILABLE:
+        attempt_type = "proxy"
+        
+        # Use proxy for first 5 attempts
+        if attempt < 5:
             proxy_url = await get_proxy()
             if proxy_url:
-                logger.info(f"Attempt {attempt+1}/{max_attempts} using proxy: {proxy_url[:30]}...")
+                logger.info(f"Attempt {attempt+1}/{max_attempts} using proxy: {proxy_url[:40]}...")
             else:
-                logger.info(f"Attempt {attempt+1}/{max_attempts} using direct connection")
+                attempt_type = "direct"
+                logger.info(f"Attempt {attempt+1}/{max_attempts} - no proxy available, trying direct")
+        else:
+            attempt_type = "direct"
+            logger.info(f"Attempt {attempt+1}/{max_attempts} - trying direct connection")
         
         try:
-            async with httpx.AsyncClient(
-                proxies=proxy_url if proxy_url else None,
-                timeout=httpx.Timeout(120.0, connect=15.0),
-                follow_redirects=True,
-                http2=False if proxy_url else True,
-                limits=httpx.Limits(max_keepalive_connections=1, max_connections=1)
-            ) as client:
+            # Build client with or without proxy
+            client_kwargs = {
+                "timeout": httpx.Timeout(120.0, connect=15.0),
+                "follow_redirects": True,
+                "limits": httpx.Limits(max_keepalive_connections=1, max_connections=1)
+            }
+            
+            if proxy_url:
+                client_kwargs["proxies"] = proxy_url
+                client_kwargs["http2"] = False
+            else:
+                client_kwargs["http2"] = True
+            
+            async with httpx.AsyncClient(**client_kwargs) as client:
                 async with client.stream("GET", decoded_url, headers=headers) as resp:
                     logger.info(f"Response: {resp.status_code}")
                     
@@ -260,7 +265,7 @@ async def proxy(request: Request, url: str):
                         if content_range:
                             response_headers["Content-Range"] = content_range
                         
-                        logger.info(f"✅ Success via {'proxy' if proxy_url else 'direct'}")
+                        logger.info(f"✅ Success via {attempt_type}")
                         
                         async def stream_generator():
                             async for chunk in resp.aiter_bytes(chunk_size=65536):
@@ -273,20 +278,14 @@ async def proxy(request: Request, url: str):
                             headers=response_headers,
                         )
                     elif resp.status_code in [403, 429, 426]:
-                        logger.warning(f"CDN returned {resp.status_code}, {'trying next proxy' if proxy_url else 'retrying...'}")
-                        # Mark proxy as dead if it returned an error
-                        if proxy_url and proxy_url in proxy_pool:
-                            proxy_pool.remove(proxy_url)
+                        logger.warning(f"CDN returned {resp.status_code}, trying next...")
                         continue
                     else:
-                        logger.warning(f"CDN returned {resp.status_code}")
+                        logger.warning(f"CDN returned {resp.status_code}, trying next...")
                         continue
                         
         except Exception as e:
             logger.error(f"Attempt {attempt+1} error: {str(e)}")
-            # Remove bad proxy from pool
-            if proxy_url and proxy_url in proxy_pool:
-                proxy_pool.remove(proxy_url)
             continue
     
     # All attempts failed
