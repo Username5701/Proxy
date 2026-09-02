@@ -24,7 +24,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load proxies from file ONLY
+# Load proxies from file
 def load_proxies():
     proxies = []
     try:
@@ -38,6 +38,8 @@ def load_proxies():
                             'url': f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}",
                             'ip': parts[0],
                             'port': parts[1],
+                            'username': parts[2],
+                            'password': parts[3],
                             'working': True
                         })
     except FileNotFoundError:
@@ -55,7 +57,6 @@ cached_token = None
 token_expiry = 0
 
 async def get_fresh_token():
-    """Get fresh token from the API with caching"""
     global cached_token, token_expiry
     now = time.time()
     
@@ -89,7 +90,6 @@ async def get_fresh_token():
         return None
 
 def build_headers(token, range_header=None):
-    """Build headers with the given token"""
     try:
         payload = json.loads(base64.b64decode(token.split('.')[1] + '==').decode('utf-8'))
         userId = str(payload.get('uid', '5449878944034578072'))
@@ -176,7 +176,6 @@ async def proxy(request: Request, url: str):
     if range_header:
         logger.info(f"Range request: {range_header}")
 
-    # Get working proxies
     working_proxies = [p for p in PROXIES if p['working']]
     if not working_proxies:
         logger.warning("No working proxies, resetting all...")
@@ -192,16 +191,66 @@ async def proxy(request: Request, url: str):
         logger.info(f"Attempt using proxy: {proxy_ip}")
         
         try:
+            # Use stream=True to prevent buffering
             async with httpx.AsyncClient(
                 proxies=proxy_url,
-                timeout=httpx.Timeout(60.0, connect=15.0),
+                timeout=httpx.Timeout(120.0, connect=15.0),
                 follow_redirects=True,
                 http2=False,
                 limits=httpx.Limits(max_keepalive_connections=1, max_connections=1)
             ) as client:
-                resp = await client.get(decoded_url, headers=headers)
-                logger.info(f"Response: {resp.status_code} from {proxy_ip}")
-                
+                async with client.stream("GET", decoded_url, headers=headers) as resp:
+                    logger.info(f"Response: {resp.status_code} from {proxy_ip}")
+                    
+                    if resp.status_code == 200 or resp.status_code == 206:
+                        content_type = resp.headers.get("content-type", "video/mp4")
+                        content_length = resp.headers.get("content-length", "")
+                        content_range = resp.headers.get("content-range", "")
+                        
+                        response_headers = {
+                            "Content-Type": content_type,
+                            "Access-Control-Allow-Origin": "*",
+                            "Cache-Control": "public, max-age=3600",
+                            "Accept-Ranges": "bytes",
+                        }
+                        if content_length:
+                            response_headers["Content-Length"] = content_length
+                        if content_range:
+                            response_headers["Content-Range"] = content_range
+                        
+                        logger.info(f"✅ Success via {proxy_ip}")
+                        
+                        async def stream_generator():
+                            async for chunk in resp.aiter_bytes(chunk_size=65536):
+                                yield chunk
+                        
+                        return StreamingResponse(
+                            stream_generator(),
+                            status_code=200,
+                            media_type=content_type,
+                            headers=response_headers,
+                        )
+                    elif resp.status_code == 403 or resp.status_code == 426:
+                        logger.warning(f"Proxy {proxy_ip} returned {resp.status_code}, marking as dead")
+                        proxy['working'] = False
+                    else:
+                        logger.warning(f"Proxy {proxy_ip} returned {resp.status_code}, trying next...")
+                        
+        except Exception as e:
+            logger.error(f"Proxy {proxy_ip} error: {str(e)}")
+            proxy['working'] = False
+            continue
+
+    # Direct connection fallback
+    logger.info("All proxies failed, trying direct connection...")
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(120.0, connect=15.0),
+            follow_redirects=True,
+            http2=True,
+            limits=httpx.Limits(max_keepalive_connections=1, max_connections=1)
+        ) as client:
+            async with client.stream("GET", decoded_url, headers=headers) as resp:
                 if resp.status_code == 200 or resp.status_code == 206:
                     content_type = resp.headers.get("content-type", "video/mp4")
                     content_length = resp.headers.get("content-length", "")
@@ -218,10 +267,8 @@ async def proxy(request: Request, url: str):
                     if content_range:
                         response_headers["Content-Range"] = content_range
                     
-                    logger.info(f"✅ Success via {proxy_ip}")
-                    
                     async def stream_generator():
-                        async for chunk in resp.aiter_bytes(chunk_size=16384):
+                        async for chunk in resp.aiter_bytes(chunk_size=65536):
                             yield chunk
                     
                     return StreamingResponse(
@@ -230,56 +277,8 @@ async def proxy(request: Request, url: str):
                         media_type=content_type,
                         headers=response_headers,
                     )
-                elif resp.status_code == 403 or resp.status_code == 426:
-                    logger.warning(f"Proxy {proxy_ip} returned {resp.status_code}, marking as dead")
-                    proxy['working'] = False
                 else:
-                    logger.warning(f"Proxy {proxy_ip} returned {resp.status_code}, trying next...")
-                    
-        except Exception as e:
-            logger.error(f"Proxy {proxy_ip} error: {str(e)}")
-            proxy['working'] = False
-            continue
-
-    # Direct connection fallback
-    logger.info("All proxies failed, trying direct connection...")
-    try:
-        async with httpx.AsyncClient(
-            timeout=httpx.Timeout(60.0, connect=15.0),
-            follow_redirects=True,
-            http2=True,
-            limits=httpx.Limits(max_keepalive_connections=1, max_connections=1)
-        ) as client:
-            resp = await client.get(decoded_url, headers=headers)
-            
-            if resp.status_code == 200 or resp.status_code == 206:
-                content_type = resp.headers.get("content-type", "video/mp4")
-                content_length = resp.headers.get("content-length", "")
-                content_range = resp.headers.get("content-range", "")
-                
-                response_headers = {
-                    "Content-Type": content_type,
-                    "Access-Control-Allow-Origin": "*",
-                    "Cache-Control": "public, max-age=3600",
-                    "Accept-Ranges": "bytes",
-                }
-                if content_length:
-                    response_headers["Content-Length"] = content_length
-                if content_range:
-                    response_headers["Content-Range"] = content_range
-                
-                async def stream_generator():
-                    async for chunk in resp.aiter_bytes(chunk_size=16384):
-                        yield chunk
-                
-                return StreamingResponse(
-                    stream_generator(),
-                    status_code=200,
-                    media_type=content_type,
-                    headers=response_headers,
-                )
-            else:
-                raise HTTPException(resp.status_code, f"CDN error: {resp.status_code}")
+                    raise HTTPException(resp.status_code, f"CDN error: {resp.status_code}")
                 
     except Exception as e:
         logger.error(f"Direct connection error: {str(e)}")
