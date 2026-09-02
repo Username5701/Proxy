@@ -1,4 +1,4 @@
-# main.py - Fixed token generation with proxy support
+# main.py
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,6 +10,7 @@ import os
 from urllib.parse import unquote
 import base64
 import random
+import time
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -23,16 +24,31 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Proxy list - from your working test
-PROXY_LIST = [
-    "http://cfkenotp:n90v2vkzp69u@31.59.20.176:6754",
-    "http://cfkenotp:n90v2vkzp69u@45.38.107.97:6014",
-    "http://cfkenotp:n90v2vkzp69u@198.105.121.200:6462",
-    "http://cfkenotp:n90v2vkzp69u@64.137.96.74:6641",
-    "http://cfkenotp:n90v2vkzp69u@84.247.60.125:6095",
-    "http://cfkenotp:n90v2vkzp69u@142.111.67.146:5611",
-    "http://cfkenotp:n90v2vkzp69u@31.58.9.4:6077",
-]
+# Load proxies from file ONLY
+def load_proxies():
+    proxies = []
+    try:
+        with open('proxies.txt', 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    parts = line.split(':')
+                    if len(parts) == 4:
+                        proxies.append({
+                            'url': f"http://{parts[2]}:{parts[3]}@{parts[0]}:{parts[1]}",
+                            'ip': parts[0],
+                            'port': parts[1],
+                            'working': True
+                        })
+    except FileNotFoundError:
+        logger.error("proxies.txt not found! Please upload the file.")
+    except Exception as e:
+        logger.error(f"Failed to load proxies: {e}")
+    return proxies
+
+PROXIES = load_proxies()
+if not PROXIES:
+    logger.warning("No proxies loaded from proxies.txt")
 
 # Token cache
 cached_token = None
@@ -41,11 +57,8 @@ token_expiry = 0
 async def get_fresh_token():
     """Get fresh token from the API with caching"""
     global cached_token, token_expiry
-    import time
-    
     now = time.time()
     
-    # Return cached token if still valid (50 minutes)
     if cached_token and token_expiry > now:
         return cached_token
     
@@ -59,42 +72,31 @@ async def get_fresh_token():
     }
     
     try:
-        # Use a direct client without proxy for token fetching
         async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as temp_client:
             resp = await temp_client.get(url, headers=headers)
-            logger.info(f"Token response status: {resp.status_code}")
-            
             set_cookie = resp.headers.get("set-cookie", "")
             match = re.search(r'token=([^;]+)', set_cookie)
             
             if match:
                 token = match.group(1)
                 cached_token = token
-                token_expiry = now + 50 * 60  # 50 minutes
+                token_expiry = now + 50 * 60
                 logger.info(f"Token obtained: {token[:30]}...")
                 return token
-            else:
-                logger.error("No token found in Set-Cookie header")
-                return None
-                
+            return None
     except Exception as e:
-        logger.error(f"Error getting token: {str(e)}")
+        logger.error(f"Token error: {str(e)}")
         return None
 
-def extract_user_id(token):
-    """Extract userId from token"""
+def build_headers(token, range_header=None):
+    """Build headers with the given token"""
     try:
         payload = json.loads(base64.b64decode(token.split('.')[1] + '==').decode('utf-8'))
-        return str(payload.get('uid', '5449878944034578072'))
-    except Exception as e:
-        logger.warning(f"Could not decode token: {e}")
-        return "5449878944034578072"
-
-def build_headers(token):
-    """Build headers with the given token"""
-    userId = extract_user_id(token)
+        userId = str(payload.get('uid', '5449878944034578072'))
+    except:
+        userId = "5449878944034578072"
     
-    return {
+    headers = {
         "User-Agent": "Mozilla/5.0 (Android 15; Mobile; rv:154.0) Gecko/154.0 Firefox/154.0",
         "Accept": "video/mp4, video/webm, video/*, */*",
         "Accept-Language": "en-US",
@@ -117,13 +119,18 @@ def build_headers(token):
         "Sec-Fetch-Site": "cross-site",
         "Upgrade-Insecure-Requests": "1",
     }
+    
+    if range_header:
+        headers["Range"] = range_header
+    
+    return headers
 
 @app.get("/")
 async def root():
     return {
         "service": "MovieBox Proxy (Railway)",
         "status": "running",
-        "proxies_available": len(PROXY_LIST),
+        "proxies_available": len(PROXIES),
         "token_cached": cached_token is not None,
         "endpoints": {
             "/proxy": "Proxy video stream from CDN",
@@ -135,63 +142,65 @@ async def root():
 @app.get("/proxies")
 async def list_proxies():
     return {
-        "total": len(PROXY_LIST),
-        "proxies": [p.split('@')[-1] if '@' in p else p for p in PROXY_LIST]
+        "total": len(PROXIES),
+        "proxies": [f"{p['ip']}:{p['port']} (working: {p['working']})" for p in PROXIES]
     }
 
 @app.get("/refresh_token")
 async def refresh_token():
-    """Force refresh the token"""
     global cached_token, token_expiry
     cached_token = None
     token_expiry = 0
     token = await get_fresh_token()
     if token:
         return {"status": "success", "token": token[:30] + "..."}
-    return {"status": "failed", "message": "Could not get token"}
+    return {"status": "failed"}
 
 @app.get("/proxy")
 async def proxy(request: Request, url: str):
     if not url:
         raise HTTPException(400, "Missing url parameter")
     
-    if not PROXY_LIST:
-        raise HTTPException(503, "No proxies available")
+    if not PROXIES:
+        raise HTTPException(503, "No proxies available. Please upload proxies.txt")
     
     decoded_url = unquote(url)
     logger.info(f"Fetching: {decoded_url}")
 
-    # Get fresh token
     token = await get_fresh_token()
     if not token:
         raise HTTPException(401, "Failed to get authorization token")
 
-    # Build headers with the token
-    headers = build_headers(token)
-
-    # Pass through Range header
     range_header = request.headers.get("range")
+    headers = build_headers(token, range_header)
     if range_header:
-        headers["Range"] = range_header
         logger.info(f"Range request: {range_header}")
 
-    # Shuffle proxies for load balancing
-    random.shuffle(PROXY_LIST)
+    # Get working proxies
+    working_proxies = [p for p in PROXIES if p['working']]
+    if not working_proxies:
+        logger.warning("No working proxies, resetting all...")
+        for p in PROXIES:
+            p['working'] = True
+        working_proxies = PROXIES
     
-    # Try each proxy
-    for i, proxy_url in enumerate(PROXY_LIST):
-        proxy_ip = proxy_url.split('@')[-1] if '@' in proxy_url else proxy_url
-        logger.info(f"Attempt {i+1}/{len(PROXY_LIST)} using proxy: {proxy_ip}")
+    random.shuffle(working_proxies)
+    
+    for proxy in working_proxies:
+        proxy_url = proxy['url']
+        proxy_ip = f"{proxy['ip']}:{proxy['port']}"
+        logger.info(f"Attempt using proxy: {proxy_ip}")
         
         try:
             async with httpx.AsyncClient(
                 proxies=proxy_url,
                 timeout=httpx.Timeout(60.0, connect=15.0),
                 follow_redirects=True,
-                http2=False,  # Disable HTTP/2 for proxies
+                http2=False,
+                limits=httpx.Limits(max_keepalive_connections=1, max_connections=1)
             ) as client:
                 resp = await client.get(decoded_url, headers=headers)
-                logger.info(f"Response: {resp.status_code} from proxy {proxy_ip}")
+                logger.info(f"Response: {resp.status_code} from {proxy_ip}")
                 
                 if resp.status_code == 200 or resp.status_code == 206:
                     content_type = resp.headers.get("content-type", "video/mp4")
@@ -209,10 +218,10 @@ async def proxy(request: Request, url: str):
                     if content_range:
                         response_headers["Content-Range"] = content_range
                     
-                    logger.info(f"✅ Success via proxy {proxy_ip}")
+                    logger.info(f"✅ Success via {proxy_ip}")
                     
                     async def stream_generator():
-                        async for chunk in resp.aiter_bytes(chunk_size=65536):
+                        async for chunk in resp.aiter_bytes(chunk_size=16384):
                             yield chunk
                     
                     return StreamingResponse(
@@ -221,23 +230,27 @@ async def proxy(request: Request, url: str):
                         media_type=content_type,
                         headers=response_headers,
                     )
+                elif resp.status_code == 403 or resp.status_code == 426:
+                    logger.warning(f"Proxy {proxy_ip} returned {resp.status_code}, marking as dead")
+                    proxy['working'] = False
                 else:
                     logger.warning(f"Proxy {proxy_ip} returned {resp.status_code}, trying next...")
                     
         except Exception as e:
             logger.error(f"Proxy {proxy_ip} error: {str(e)}")
+            proxy['working'] = False
             continue
 
-    # If all proxies fail, try direct connection (no proxy)
+    # Direct connection fallback
     logger.info("All proxies failed, trying direct connection...")
     try:
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(60.0, connect=15.0),
             follow_redirects=True,
             http2=True,
+            limits=httpx.Limits(max_keepalive_connections=1, max_connections=1)
         ) as client:
             resp = await client.get(decoded_url, headers=headers)
-            logger.info(f"Direct response: {resp.status_code}")
             
             if resp.status_code == 200 or resp.status_code == 206:
                 content_type = resp.headers.get("content-type", "video/mp4")
@@ -255,10 +268,8 @@ async def proxy(request: Request, url: str):
                 if content_range:
                     response_headers["Content-Range"] = content_range
                 
-                logger.info("✅ Success via direct connection")
-                
                 async def stream_generator():
-                    async for chunk in resp.aiter_bytes(chunk_size=65536):
+                    async for chunk in resp.aiter_bytes(chunk_size=16384):
                         yield chunk
                 
                 return StreamingResponse(
