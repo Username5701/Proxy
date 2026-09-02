@@ -1,4 +1,4 @@
-# main.py - Updated with 20 proxy attempts before giving up
+# main.py - Railway proxy with databay proxy rotation (FIXED TESTING)
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -32,7 +32,7 @@ PROXY_FILE_URL = "https://databay.com/free-proxy-list/http.txt"
 proxy_pool = []
 last_refresh = 0
 PROXY_REFRESH_INTERVAL = 300  # 5 minutes
-MAX_PROXY_ATTEMPTS = 20  # Try up to 20 proxies before giving up
+MAX_PROXY_ATTEMPTS = 30  # Try up to 30 proxies
 
 async def refresh_proxy_pool():
     """Fetch fresh proxies from databay API"""
@@ -74,11 +74,34 @@ async def refresh_proxy_pool():
     
     if new_proxies:
         random.shuffle(new_proxies)
-        proxy_pool = new_proxies[:200]  # Keep top 200
+        proxy_pool = new_proxies[:200]
         last_refresh = time.time()
         logger.info(f"✅ Proxy pool updated: {len(proxy_pool)} proxies")
     else:
         logger.warning("⚠️ No proxies fetched, keeping existing pool")
+
+async def test_proxy(proxy_url, test_url, headers):
+    """Test a proxy using GET with small range (more reliable than HEAD)"""
+    try:
+        # Use a small range request (first 1KB) to test
+        test_headers = headers.copy()
+        test_headers["Range"] = "bytes=0-1024"
+        
+        async with httpx.AsyncClient(
+            proxies=proxy_url,
+            timeout=httpx.Timeout(8.0, connect=4.0),
+            follow_redirects=True,
+            http2=False
+        ) as client:
+            resp = await client.get(test_url, headers=test_headers)
+            
+            # 200, 206, or 416 are all valid responses
+            if resp.status_code in [200, 206, 416]:
+                return True
+            else:
+                return False
+    except Exception as e:
+        return False
 
 async def get_working_proxy(headers, url, max_attempts=MAX_PROXY_ATTEMPTS):
     """Find a working proxy by testing up to max_attempts"""
@@ -93,49 +116,29 @@ async def get_working_proxy(headers, url, max_attempts=MAX_PROXY_ATTEMPTS):
     # Make a copy of the pool to work with
     test_pool = proxy_pool.copy()
     tested = 0
-    working_proxies = []
     
     while test_pool and tested < max_attempts:
-        # Get a random proxy from the pool
         proxy_url = random.choice(test_pool)
         test_pool.remove(proxy_url)
         tested += 1
         
-        try:
-            logger.info(f"Testing proxy {tested}/{max_attempts}: {proxy_url[:40]}...")
-            
-            async with httpx.AsyncClient(
-                proxies=proxy_url,
-                timeout=httpx.Timeout(5.0, connect=3.0),
-                follow_redirects=True,
-                http2=False
-            ) as client:
-                resp = await client.head(url, headers=headers)
-                
-                if resp.status_code == 200 or resp.status_code == 206:
-                    logger.info(f"✅ Found working proxy: {proxy_url[:40]}...")
-                    # Move this proxy to the front of the pool for next time
-                    if proxy_url in proxy_pool:
-                        proxy_pool.remove(proxy_url)
-                        proxy_pool.insert(0, proxy_url)
-                    return proxy_url
-                elif resp.status_code == 403 or resp.status_code == 429:
-                    # Remove blocked proxy from pool
-                    if proxy_url in proxy_pool:
-                        proxy_pool.remove(proxy_url)
-                        logger.info(f"❌ Proxy blocked (403/429): {proxy_url[:40]}...")
-                else:
-                    # Other errors, remove from pool
-                    if proxy_url in proxy_pool:
-                        proxy_pool.remove(proxy_url)
-                        logger.info(f"❌ Proxy failed ({resp.status_code}): {proxy_url[:40]}...")
-                        
-        except Exception as e:
-            # Remove dead proxy
+        logger.info(f"Testing proxy {tested}/{max_attempts}: {proxy_url[:40]}...")
+        
+        # Quick test using GET with small range
+        is_working = await test_proxy(proxy_url, url, headers)
+        
+        if is_working:
+            logger.info(f"✅ Found working proxy: {proxy_url[:40]}...")
+            # Move to front of pool for next time
             if proxy_url in proxy_pool:
                 proxy_pool.remove(proxy_url)
-            logger.info(f"❌ Proxy error: {proxy_url[:40]}... - {str(e)[:30]}")
-            continue
+                proxy_pool.insert(0, proxy_url)
+            return proxy_url
+        else:
+            # Remove dead proxy from pool
+            if proxy_url in proxy_pool:
+                proxy_pool.remove(proxy_url)
+                logger.info(f"❌ Proxy failed: {proxy_url[:40]}...")
     
     logger.info(f"No working proxy found after {tested} attempts")
     return None
@@ -218,7 +221,6 @@ def build_headers(token, range_header=None):
 # ==================== ENDPOINTS ====================
 @app.on_event("startup")
 async def startup_event():
-    """Pre-fill proxy pool on startup"""
     logger.info("🔄 Pre-filling proxy pool from databay...")
     await refresh_proxy_pool()
     logger.info(f"✅ Proxy pool ready: {len(proxy_pool)} proxies")
@@ -271,7 +273,7 @@ async def proxy(request: Request, url: str):
     if range_header:
         logger.info(f"Range request: {range_header}")
 
-    # Try to find a working proxy (up to 20 attempts)
+    # Try to find a working proxy
     proxy_url = await get_working_proxy(headers, decoded_url, max_attempts=MAX_PROXY_ATTEMPTS)
     
     if proxy_url:
@@ -279,7 +281,6 @@ async def proxy(request: Request, url: str):
     else:
         logger.info("⚠️ No working proxy found, trying direct connection")
     
-    # Make the request with or without proxy
     try:
         client_kwargs = {
             "timeout": httpx.Timeout(120.0, connect=15.0),
