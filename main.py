@@ -1,4 +1,4 @@
-# main.py - Railway proxy with multiple proxy sources and fallbacks
+# main.py - Railway proxy with databay proxy rotation
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,65 +25,66 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ==================== PROXY POOL ====================
+# ==================== PROXY CONFIGURATION ====================
+# Use databay API for fresh proxies
+PROXY_API_URL = "https://databay.com/api/v1/proxy-list?ssl=strict&protocol=http&format=json&limit=100"
+# Fallback direct file if API fails
+PROXY_FILE_URL = "https://databay.com/free-proxy-list/http.txt"
+
 proxy_pool = []
 last_refresh = 0
-
-# Multiple proxy sources (fallback if one fails)
-PROXY_SOURCES = [
-    "https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/http.txt",
-    "https://raw.githubusercontent.com/proxmint/free-proxy-list/main/proxies/http.txt",
-    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-    "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text",
-]
+PROXY_REFRESH_INTERVAL = 300  # 5 minutes
 
 async def refresh_proxy_pool():
-    """Fetch fresh proxies from multiple sources"""
+    """Fetch fresh proxies from databay API"""
     global proxy_pool, last_refresh
     
-    # Don't refresh more than once every 5 minutes
-    if time.time() - last_refresh < 300:
-        logger.info("Using cached proxy pool (refreshed within 5 minutes)")
+    if time.time() - last_refresh < PROXY_REFRESH_INTERVAL:
+        logger.info(f"Using cached proxy pool ({len(proxy_pool)} proxies)")
         return
     
-    logger.info("🔄 Fetching fresh proxies...")
+    logger.info("🔄 Fetching fresh proxies from databay...")
     new_proxies = []
     
-    for source in PROXY_SOURCES:
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.get(source)
+    try:
+        # Try API first
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(PROXY_API_URL)
+            if resp.status_code == 200:
+                data = resp.json()
+                for p in data.get("data", []):
+                    proxy = f"http://{p['ip']}:{p['port']}"
+                    if proxy not in new_proxies:
+                        new_proxies.append(proxy)
+                logger.info(f"✅ Fetched {len(new_proxies)} proxies from API")
+            else:
+                logger.warning(f"API returned {resp.status_code}, trying file...")
+                # Fallback to file
+                resp = await client.get(PROXY_FILE_URL)
                 if resp.status_code == 200:
-                    content = resp.text.strip()
-                    lines = content.split('\n')
-                    count = 0
+                    lines = resp.text.strip().split('\n')
                     for line in lines:
                         line = line.strip()
                         if line and not line.startswith('#'):
-                            # Handle different formats
-                            if ':' in line:
-                                parts = line.split(':')
-                                if len(parts) == 2:
-                                    proxy = f"http://{parts[0]}:{parts[1]}"
-                                    if proxy not in new_proxies:
-                                        new_proxies.append(proxy)
-                                        count += 1
-                    logger.info(f"✅ Fetched {count} proxies from {source[:50]}...")
-                else:
-                    logger.warning(f"Source returned {resp.status_code}: {source[:50]}...")
-        except Exception as e:
-            logger.warning(f"Failed to fetch from {source[:50]}...: {str(e)[:50]}")
+                            parts = line.split(':')
+                            if len(parts) == 2:
+                                proxy = f"http://{parts[0]}:{parts[1]}"
+                                if proxy not in new_proxies:
+                                    new_proxies.append(proxy)
+                    logger.info(f"✅ Fetched {len(new_proxies)} proxies from file")
+    except Exception as e:
+        logger.error(f"Proxy fetch error: {str(e)}")
     
     if new_proxies:
         random.shuffle(new_proxies)
-        proxy_pool = new_proxies[:50]
+        proxy_pool = new_proxies[:100]  # Keep top 100
         last_refresh = time.time()
         logger.info(f"✅ Proxy pool updated: {len(proxy_pool)} proxies")
     else:
-        logger.warning("⚠️ No proxies fetched from any source, keeping existing pool")
+        logger.warning("⚠️ No proxies fetched, keeping existing pool")
 
-async def get_proxy():
-    """Get a random proxy from the pool"""
+async def get_working_proxy(headers, url, max_attempts=10):
+    """Get a working proxy by testing quickly"""
     global proxy_pool
     
     if not proxy_pool:
@@ -92,7 +93,36 @@ async def get_proxy():
     if not proxy_pool:
         return None
     
-    return random.choice(proxy_pool)
+    # Try proxies from the pool
+    tested = 0
+    for proxy_url in proxy_pool:
+        if tested >= max_attempts:
+            break
+        tested += 1
+        
+        try:
+            # Quick HEAD test to check if proxy works
+            async with httpx.AsyncClient(
+                proxies=proxy_url,
+                timeout=httpx.Timeout(5.0, connect=3.0),
+                follow_redirects=True,
+                http2=False
+            ) as client:
+                resp = await client.head(url, headers=headers)
+                if resp.status_code == 200 or resp.status_code == 206:
+                    logger.info(f"✅ Found working proxy: {proxy_url[:40]}...")
+                    return proxy_url
+                elif resp.status_code == 403 or resp.status_code == 429:
+                    # Remove bad proxy
+                    proxy_pool.remove(proxy_url)
+                    logger.info(f"❌ Proxy blocked: {proxy_url[:40]}...")
+        except Exception as e:
+            # Remove dead proxy
+            if proxy_url in proxy_pool:
+                proxy_pool.remove(proxy_url)
+            continue
+    
+    return None
 
 # ==================== TOKEN MANAGEMENT ====================
 cached_token = None
@@ -173,7 +203,7 @@ def build_headers(token, range_header=None):
 @app.on_event("startup")
 async def startup_event():
     """Pre-fill proxy pool on startup"""
-    logger.info("🔄 Pre-filling proxy pool...")
+    logger.info("🔄 Pre-filling proxy pool from databay...")
     await refresh_proxy_pool()
     logger.info(f"✅ Proxy pool ready: {len(proxy_pool)} proxies")
 
@@ -185,13 +215,20 @@ async def root():
         "proxy_pool_size": len(proxy_pool),
         "endpoints": {
             "/proxy": "Proxy video stream from CDN",
-            "/refresh_proxies": "Force refresh proxy pool"
+            "/refresh_proxies": "Force refresh proxy pool",
+            "/proxies": "List available proxies"
         }
+    }
+
+@app.get("/proxies")
+async def list_proxies():
+    return {
+        "total": len(proxy_pool),
+        "proxies": [p[:40] + "..." for p in proxy_pool[:20]]
     }
 
 @app.get("/refresh_proxies")
 async def refresh_proxies():
-    """Force refresh the proxy pool"""
     global proxy_pool, last_refresh
     proxy_pool = []
     last_refresh = 0
@@ -218,83 +255,67 @@ async def proxy(request: Request, url: str):
     if range_header:
         logger.info(f"Range request: {range_header}")
 
-    # Try proxies, then fallback to direct
-    max_attempts = 6  # 5 proxies + direct
+    # Try to find a working proxy quickly
+    proxy_url = await get_working_proxy(headers, decoded_url, max_attempts=10)
     
-    for attempt in range(max_attempts):
-        proxy_url = None
-        attempt_type = "proxy"
+    if proxy_url:
+        logger.info(f"Using proxy: {proxy_url[:40]}...")
+    else:
+        logger.info("No working proxy found, trying direct connection")
+    
+    # Make the request with or without proxy
+    try:
+        client_kwargs = {
+            "timeout": httpx.Timeout(120.0, connect=15.0),
+            "follow_redirects": True,
+            "limits": httpx.Limits(max_keepalive_connections=1, max_connections=1)
+        }
         
-        # Use proxy for first 5 attempts
-        if attempt < 5:
-            proxy_url = await get_proxy()
-            if proxy_url:
-                logger.info(f"Attempt {attempt+1}/{max_attempts} using proxy: {proxy_url[:40]}...")
-            else:
-                attempt_type = "direct"
-                logger.info(f"Attempt {attempt+1}/{max_attempts} - no proxy available, trying direct")
+        if proxy_url:
+            client_kwargs["proxies"] = proxy_url
+            client_kwargs["http2"] = False
         else:
-            attempt_type = "direct"
-            logger.info(f"Attempt {attempt+1}/{max_attempts} - trying direct connection")
+            client_kwargs["http2"] = True
         
-        try:
-            client_kwargs = {
-                "timeout": httpx.Timeout(120.0, connect=15.0),
-                "follow_redirects": True,
-                "limits": httpx.Limits(max_keepalive_connections=1, max_connections=1)
-            }
-            
-            if proxy_url:
-                client_kwargs["proxies"] = proxy_url
-                client_kwargs["http2"] = False
-            else:
-                client_kwargs["http2"] = True
-            
-            async with httpx.AsyncClient(**client_kwargs) as client:
-                async with client.stream("GET", decoded_url, headers=headers) as resp:
-                    logger.info(f"Response: {resp.status_code}")
+        async with httpx.AsyncClient(**client_kwargs) as client:
+            async with client.stream("GET", decoded_url, headers=headers) as resp:
+                logger.info(f"Response: {resp.status_code}")
+                
+                if resp.status_code == 200 or resp.status_code == 206:
+                    content_type = resp.headers.get("content-type", "video/mp4")
+                    content_length = resp.headers.get("content-length", "")
+                    content_range = resp.headers.get("content-range", "")
                     
-                    if resp.status_code == 200 or resp.status_code == 206:
-                        content_type = resp.headers.get("content-type", "video/mp4")
-                        content_length = resp.headers.get("content-length", "")
-                        content_range = resp.headers.get("content-range", "")
+                    response_headers = {
+                        "Content-Type": content_type,
+                        "Access-Control-Allow-Origin": "*",
+                        "Cache-Control": "public, max-age=3600",
+                        "Accept-Ranges": "bytes",
+                    }
+                    if content_length:
+                        response_headers["Content-Length"] = content_length
+                    if content_range:
+                        response_headers["Content-Range"] = content_range
+                    
+                    logger.info(f"✅ Success via {'proxy' if proxy_url else 'direct'}")
+                    
+                    async def stream_generator():
+                        async for chunk in resp.aiter_bytes(chunk_size=65536):
+                            yield chunk
+                    
+                    return StreamingResponse(
+                        stream_generator(),
+                        status_code=200,
+                        media_type=content_type,
+                        headers=response_headers,
+                    )
+                else:
+                    logger.error(f"Request failed: {resp.status_code}")
+                    raise HTTPException(resp.status_code, f"CDN error: {resp.status_code}")
                         
-                        response_headers = {
-                            "Content-Type": content_type,
-                            "Access-Control-Allow-Origin": "*",
-                            "Cache-Control": "public, max-age=3600",
-                            "Accept-Ranges": "bytes",
-                        }
-                        if content_length:
-                            response_headers["Content-Length"] = content_length
-                        if content_range:
-                            response_headers["Content-Range"] = content_range
-                        
-                        logger.info(f"✅ Success via {attempt_type}")
-                        
-                        async def stream_generator():
-                            async for chunk in resp.aiter_bytes(chunk_size=65536):
-                                yield chunk
-                        
-                        return StreamingResponse(
-                            stream_generator(),
-                            status_code=200,
-                            media_type=content_type,
-                            headers=response_headers,
-                        )
-                    elif resp.status_code in [403, 429, 426]:
-                        logger.warning(f"CDN returned {resp.status_code}, trying next...")
-                        continue
-                    else:
-                        logger.warning(f"CDN returned {resp.status_code}, trying next...")
-                        continue
-                        
-        except Exception as e:
-            logger.error(f"Attempt {attempt+1} error: {str(e)}")
-            continue
-    
-    # All attempts failed
-    raise HTTPException(503, "All proxy attempts failed. Please try again later.")
+    except Exception as e:
+        logger.error(f"Request error: {str(e)}")
+        raise HTTPException(503, f"Request failed: {str(e)}")
 
 @app.on_event("shutdown")
 async def shutdown():
