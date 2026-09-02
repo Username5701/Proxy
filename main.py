@@ -1,4 +1,3 @@
-# main.py - with proxy rotation support
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,8 +7,7 @@ import json
 import logging
 import os
 from urllib.parse import unquote
-import random
-import asyncio
+import base64
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -23,7 +21,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load proxies from file
 def load_proxies():
     proxies = []
     try:
@@ -44,12 +41,10 @@ def load_proxies():
         logger.error(f"Failed to load proxies: {e}")
     return proxies
 
-# Global proxy list
 PROXIES = load_proxies()
 current_proxy_index = 0
 
 def get_next_proxy():
-    """Rotate through proxies"""
     global current_proxy_index
     if not PROXIES:
         return None
@@ -58,19 +53,17 @@ def get_next_proxy():
     return proxy
 
 def mark_proxy_dead(proxy_ip):
-    """Remove dead proxy from rotation"""
     global PROXIES
     PROXIES = [p for p in PROXIES if p['ip'] != proxy_ip]
     logger.warning(f"Proxy {proxy_ip} removed. {len(PROXIES)} remaining.")
 
-# HTTP/2 client with proxy support
 async def get_proxy_client(proxy_url=None):
     if proxy_url:
         return httpx.AsyncClient(
             http2=True,
             timeout=httpx.Timeout(120.0, connect=30.0),
             follow_redirects=True,
-            proxy=proxy_url,
+            proxies=proxy_url,  # FIXED: use 'proxies' not 'proxy'
             limits=httpx.Limits(max_keepalive_connections=10, max_connections=50)
         )
     return httpx.AsyncClient(
@@ -81,7 +74,6 @@ async def get_proxy_client(proxy_url=None):
     )
 
 async def get_fresh_token():
-    """Get fresh token from the API"""
     url = "https://h5-api.aoneroom.com/wefeed-h5api-bff/country-code"
     headers = {
         "User-Agent": "Mozilla/5.0 (Android 15; Mobile; rv:153.0) Gecko/153.0 Firefox/153.0",
@@ -90,9 +82,7 @@ async def get_fresh_token():
         "Origin": "https://movieboxonline.net",
         "Referer": "https://movieboxonline.net/",
     }
-    
     try:
-        # Use a direct client without proxy for token fetching
         async with httpx.AsyncClient() as temp_client:
             resp = await temp_client.get(url, headers=headers)
             set_cookie = resp.headers.get("set-cookie", "")
@@ -113,8 +103,7 @@ async def root():
         "endpoints": {
             "/proxy": "Proxy video stream from CDN",
             "/proxies": "List available proxies"
-        },
-        "usage": "/proxy?url=ENCODED_CDN_URL"
+        }
     }
 
 @app.get("/proxies")
@@ -126,31 +115,26 @@ async def list_proxies():
 
 @app.get("/proxy")
 async def proxy(request: Request, url: str):
-    """Proxy video stream from CDN with proxy rotation"""
     if not url:
         raise HTTPException(400, "Missing url parameter")
     
     if not PROXIES:
-        raise HTTPException(503, "No proxies available")
+        raise HTTPException(503, "No proxies available. Upload new proxies to proxies.txt")
     
     decoded_url = unquote(url)
     logger.info(f"Fetching: {decoded_url}")
 
-    # Get token first (without proxy)
     token = await get_fresh_token()
     if not token:
         raise HTTPException(401, "Failed to get authorization token")
 
-    # Extract userId from token
     userId = "5449878944034578072"
     try:
-        import base64
         payload = json.loads(base64.b64decode(token.split('.')[1] + '==').decode('utf-8'))
         userId = str(payload.get('uid', userId))
     except Exception as e:
         logger.warning(f"Could not decode token: {e}")
 
-    # Build headers
     headers = {
         "User-Agent": "Mozilla/5.0 (Android 15; Mobile; rv:154.0) Gecko/154.0 Firefox/154.0",
         "Accept": "video/mp4, video/webm, video/*, */*",
@@ -178,9 +162,7 @@ async def proxy(request: Request, url: str):
     range_header = request.headers.get("range")
     if range_header:
         headers["Range"] = range_header
-        logger.info(f"Range request: {range_header}")
 
-    # Try proxies with retry
     max_retries = len(PROXIES)
     for attempt in range(max_retries):
         proxy = get_next_proxy()
@@ -193,16 +175,14 @@ async def proxy(request: Request, url: str):
         try:
             async with await get_proxy_client(proxy_url) as client:
                 resp = await client.get(decoded_url, headers=headers)
-                logger.info(f"Response status: {resp.status_code} from proxy {proxy['ip']}")
+                logger.info(f"Response: {resp.status_code} from proxy {proxy['ip']}")
                 
                 if resp.status_code == 426:
-                    # Try HTTP/1.1
-                    async with httpx.AsyncClient(http2=False, timeout=30.0, proxy=proxy_url) as http1_client:
+                    async with httpx.AsyncClient(http2=False, timeout=30.0, proxies=proxy_url) as http1_client:
                         resp = await http1_client.get(decoded_url, headers=headers)
                         logger.info(f"HTTP/1.1 response: {resp.status_code}")
                 
                 if resp.status_code == 200 or resp.status_code == 206:
-                    # Success - stream response
                     content_type = resp.headers.get("content-type", "video/mp4")
                     content_length = resp.headers.get("content-length", "")
                     content_range = resp.headers.get("content-range", "")
@@ -218,10 +198,10 @@ async def proxy(request: Request, url: str):
                     if content_range:
                         response_headers["Content-Range"] = content_range
                     
-                    logger.info(f"Streaming: {content_length} bytes via proxy {proxy['ip']}")
+                    logger.info(f"✅ Success via proxy {proxy['ip']}")
                     
                     async def stream_generator():
-                        async for chunk in resp.aiter_bytes(chunk_size=8192):
+                        async for chunk in resp.aiter_bytes(chunk_size=65536):
                             yield chunk
                     
                     return StreamingResponse(
@@ -231,8 +211,7 @@ async def proxy(request: Request, url: str):
                         headers=response_headers,
                     )
                 else:
-                    # Proxy failed, mark and try next
-                    logger.warning(f"Proxy {proxy['ip']} returned {resp.status_code}, trying next...")
+                    logger.warning(f"Proxy {proxy['ip']} returned {resp.status_code}")
                     mark_proxy_dead(proxy['ip'])
                     
         except Exception as e:
@@ -240,8 +219,7 @@ async def proxy(request: Request, url: str):
             mark_proxy_dead(proxy['ip'])
             continue
 
-    # All proxies failed
-    raise HTTPException(503, "All proxies failed. Please upload new proxies.")
+    raise HTTPException(503, "All proxies failed. Please upload new proxies to proxies.txt")
 
 @app.on_event("shutdown")
 async def shutdown():
