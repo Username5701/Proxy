@@ -1,4 +1,4 @@
-# main.py
+# main.py - Railway with proxy-scraper rotation
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,9 +11,7 @@ from urllib.parse import unquote
 import base64
 import time
 import asyncio
-
-# Install swiftshadow if not present
-# pip install swiftshadow
+import random
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -27,14 +25,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Try to import swiftshadow
+# Try to import proxy-scraper
 try:
-    from swiftshadow import QuickProxy, Proxy
-    SWIFTSHADOW_AVAILABLE = True
-    logger.info("✅ swiftshadow available - using automatic proxy rotation")
+    from proxy_scraper import scraper
+    PROXY_SCRAPER_AVAILABLE = True
+    logger.info("✅ proxy-scraper available - using automatic proxy rotation")
 except ImportError:
-    SWIFTSHADOW_AVAILABLE = False
-    logger.warning("⚠️ swiftshadow not installed - falling back to direct connection")
+    PROXY_SCRAPER_AVAILABLE = False
+    logger.warning("⚠️ proxy-scraper not installed - falling back to direct connection")
 
 # Token cache
 cached_token = None
@@ -44,48 +42,64 @@ token_expiry = 0
 proxy_pool = []
 
 async def refresh_proxy_pool():
-    """Refresh proxy pool from swiftshadow"""
+    """Refresh proxy pool from proxy-scraper"""
     global proxy_pool
-    if not SWIFTSHADOW_AVAILABLE:
+    if not PROXY_SCRAPER_AVAILABLE:
         return
     
     try:
         # Run in thread pool to avoid blocking
         loop = asyncio.get_event_loop()
-        proxy = await loop.run_in_executor(None, lambda: QuickProxy())
-        if proxy:
-            # Parse proxy string (format: http://ip:port or http://user:pass@ip:port)
-            proxy_str = str(proxy)
-            logger.info(f"✅ Proxy obtained: {proxy_str[:30]}...")
-            proxy_pool.append(proxy_str)
+        
+        # Get proxies from different sources
+        proxies = await loop.run_in_executor(
+            None, 
+            lambda: scraper.get_proxies(
+                protocol="http",
+                country="all",
+                anonymity="all",
+                limit=10,
+                timeout=5
+            )
+        )
+        
+        if proxies:
+            for proxy in proxies:
+                # Format: http://ip:port
+                proxy_str = f"http://{proxy.ip}:{proxy.port}"
+                if proxy_str not in proxy_pool:
+                    proxy_pool.append(proxy_str)
+            
             # Keep only last 20 proxies
             if len(proxy_pool) > 20:
                 proxy_pool = proxy_pool[-20:]
+            
+            logger.info(f"✅ Proxy pool refreshed: {len(proxy_pool)} proxies")
+        else:
+            logger.warning("No proxies returned from scraper")
+            
     except Exception as e:
-        logger.error(f"Failed to get proxy: {str(e)}")
+        logger.error(f"Failed to get proxies: {str(e)}")
 
 async def get_proxy():
-    """Get a proxy from the pool or generate a fresh one"""
+    """Get a proxy from the pool"""
     global proxy_pool
     
-    if not SWIFTSHADOW_AVAILABLE:
+    if not PROXY_SCRAPER_AVAILABLE:
         return None
     
-    # If pool has proxies, return one
-    if proxy_pool:
-        # Rotate through pool
-        proxy = proxy_pool.pop(0)
-        # Refill if low
-        if len(proxy_pool) < 5:
-            await refresh_proxy_pool()
-        return proxy
+    # If pool is empty, refresh
+    if not proxy_pool:
+        await refresh_proxy_pool()
     
-    # Pool empty, get fresh
-    await refresh_proxy_pool()
-    if proxy_pool:
-        return proxy_pool.pop(0)
+    # If still empty, return None
+    if not proxy_pool:
+        return None
     
-    return None
+    # Get a random proxy from the pool
+    proxy = random.choice(proxy_pool)
+    
+    return proxy
 
 async def get_fresh_token():
     """Get fresh token from the API"""
@@ -161,10 +175,9 @@ def build_headers(token, range_header=None):
 @app.on_event("startup")
 async def startup_event():
     """Pre-fill proxy pool on startup"""
-    if SWIFTSHADOW_AVAILABLE:
+    if PROXY_SCRAPER_AVAILABLE:
         logger.info("🔄 Pre-filling proxy pool...")
-        for _ in range(5):
-            await refresh_proxy_pool()
+        await refresh_proxy_pool()
         logger.info(f"✅ Proxy pool ready: {len(proxy_pool)} proxies")
 
 @app.get("/")
@@ -173,7 +186,7 @@ async def root():
         "service": "MovieBox Proxy (Railway)",
         "status": "running",
         "proxy_pool_size": len(proxy_pool),
-        "swiftshadow_available": SWIFTSHADOW_AVAILABLE,
+        "proxy_scraper_available": PROXY_SCRAPER_AVAILABLE,
         "endpoints": {
             "/proxy": "Proxy video stream from CDN",
             "/refresh_proxies": "Force refresh proxy pool"
@@ -185,8 +198,7 @@ async def refresh_proxies():
     """Force refresh the proxy pool"""
     global proxy_pool
     proxy_pool = []
-    for _ in range(5):
-        await refresh_proxy_pool()
+    await refresh_proxy_pool()
     return {
         "status": "refreshed",
         "proxy_pool_size": len(proxy_pool)
@@ -210,14 +222,16 @@ async def proxy(request: Request, url: str):
         logger.info(f"Range request: {range_header}")
 
     # Try with proxy if available, fallback to direct
-    max_attempts = 5 if SWIFTSHADOW_AVAILABLE else 1
+    max_attempts = 3 if PROXY_SCRAPER_AVAILABLE else 1
     
     for attempt in range(max_attempts):
         proxy_url = None
-        if SWIFTSHADOW_AVAILABLE:
+        if PROXY_SCRAPER_AVAILABLE:
             proxy_url = await get_proxy()
             if proxy_url:
-                logger.info(f"Attempt {attempt+1}/{max_attempts} using proxy")
+                logger.info(f"Attempt {attempt+1}/{max_attempts} using proxy: {proxy_url[:30]}...")
+            else:
+                logger.info(f"Attempt {attempt+1}/{max_attempts} using direct connection")
         
         try:
             async with httpx.AsyncClient(
@@ -258,15 +272,21 @@ async def proxy(request: Request, url: str):
                             media_type=content_type,
                             headers=response_headers,
                         )
-                    elif resp.status_code == 403 or resp.status_code == 429 or resp.status_code == 426:
+                    elif resp.status_code in [403, 429, 426]:
                         logger.warning(f"CDN returned {resp.status_code}, {'trying next proxy' if proxy_url else 'retrying...'}")
+                        # Mark proxy as dead if it returned an error
+                        if proxy_url and proxy_url in proxy_pool:
+                            proxy_pool.remove(proxy_url)
                         continue
                     else:
-                        logger.warning(f"CDN returned {resp.status_code}, {'trying next proxy' if proxy_url else 'failed'}")
+                        logger.warning(f"CDN returned {resp.status_code}")
                         continue
                         
         except Exception as e:
             logger.error(f"Attempt {attempt+1} error: {str(e)}")
+            # Remove bad proxy from pool
+            if proxy_url and proxy_url in proxy_pool:
+                proxy_pool.remove(proxy_url)
             continue
     
     # All attempts failed
