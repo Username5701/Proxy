@@ -59,11 +59,12 @@ def mark_proxy_dead(proxy_ip):
 
 async def get_proxy_client(proxy_url=None):
     if proxy_url:
+        # Disable HTTP/2 for proxy connections
         return httpx.AsyncClient(
-            http2=True,
+            http2=False,
             timeout=httpx.Timeout(120.0, connect=30.0),
             follow_redirects=True,
-            proxies=proxy_url,  # FIXED: use 'proxies' not 'proxy'
+            proxies=proxy_url,
             limits=httpx.Limits(max_keepalive_connections=10, max_connections=50)
         )
     return httpx.AsyncClient(
@@ -178,7 +179,13 @@ async def proxy(request: Request, url: str):
                 logger.info(f"Response: {resp.status_code} from proxy {proxy['ip']}")
                 
                 if resp.status_code == 426:
-                    async with httpx.AsyncClient(http2=False, timeout=30.0, proxies=proxy_url) as http1_client:
+                    # Try HTTP/1.1 with proxy
+                    async with httpx.AsyncClient(
+                        http2=False, 
+                        timeout=30.0, 
+                        proxies=proxy_url,
+                        follow_redirects=True
+                    ) as http1_client:
                         resp = await http1_client.get(decoded_url, headers=headers)
                         logger.info(f"HTTP/1.1 response: {resp.status_code}")
                 
