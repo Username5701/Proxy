@@ -156,7 +156,6 @@ async def proxy(request: Request, url: str):
                                 raise HTTPException(resp2.status_code, f"CDN error: {resp2.status_code}")
                             
                             content_type = resp2.headers.get("content-type", "video/mp4")
-                            content_length = resp2.headers.get("content-length", "")
                             content_range = resp2.headers.get("content-range", "")
                             
                             response_headers = {
@@ -165,15 +164,17 @@ async def proxy(request: Request, url: str):
                                 "Cache-Control": "public, max-age=3600",
                                 "Accept-Ranges": "bytes",
                             }
-                            if content_length:
-                                response_headers["Content-Length"] = content_length
+                            # IMPORTANT: DO NOT forward Content-Length
                             if content_range:
                                 response_headers["Content-Range"] = content_range
                             
                             async def stream_generator():
-                                async for chunk in resp2.aiter_bytes(chunk_size=65536):
-                                    if chunk:
-                                        yield chunk
+                                try:
+                                    async for chunk in resp2.aiter_bytes(chunk_size=65536):
+                                        if chunk:
+                                            yield chunk
+                                except Exception as e:
+                                    logger.error(f"Stream error: {str(e)}")
                             
                             logger.info(f"✅ Streaming started (HTTP/1.1)")
                             return StreamingResponse(
@@ -189,7 +190,6 @@ async def proxy(request: Request, url: str):
                     raise HTTPException(resp.status_code, f"CDN error: {resp.status_code}")
                 
                 content_type = resp.headers.get("content-type", "video/mp4")
-                content_length = resp.headers.get("content-length", "")
                 content_range = resp.headers.get("content-range", "")
                 
                 response_headers = {
@@ -198,8 +198,7 @@ async def proxy(request: Request, url: str):
                     "Cache-Control": "public, max-age=3600",
                     "Accept-Ranges": "bytes",
                 }
-                if content_length:
-                    response_headers["Content-Length"] = content_length
+                # IMPORTANT: DO NOT forward Content-Length
                 if content_range:
                     response_headers["Content-Range"] = content_range
                 
