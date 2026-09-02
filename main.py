@@ -1,4 +1,4 @@
-# main.py
+# main.py - Fixed streaming context
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -191,51 +191,62 @@ async def proxy(request: Request, url: str):
         logger.info(f"Attempt using proxy: {proxy_ip}")
         
         try:
-            # Use stream=True to prevent buffering
-            async with httpx.AsyncClient(
+            # Create client
+            client = httpx.AsyncClient(
                 proxies=proxy_url,
                 timeout=httpx.Timeout(120.0, connect=15.0),
                 follow_redirects=True,
                 http2=False,
                 limits=httpx.Limits(max_keepalive_connections=1, max_connections=1)
-            ) as client:
-                async with client.stream("GET", decoded_url, headers=headers) as resp:
-                    logger.info(f"Response: {resp.status_code} from {proxy_ip}")
-                    
-                    if resp.status_code == 200 or resp.status_code == 206:
-                        content_type = resp.headers.get("content-type", "video/mp4")
-                        content_length = resp.headers.get("content-length", "")
-                        content_range = resp.headers.get("content-range", "")
-                        
-                        response_headers = {
-                            "Content-Type": content_type,
-                            "Access-Control-Allow-Origin": "*",
-                            "Cache-Control": "public, max-age=3600",
-                            "Accept-Ranges": "bytes",
-                        }
-                        if content_length:
-                            response_headers["Content-Length"] = content_length
-                        if content_range:
-                            response_headers["Content-Range"] = content_range
-                        
-                        logger.info(f"✅ Success via {proxy_ip}")
-                        
-                        async def stream_generator():
-                            async for chunk in resp.aiter_bytes(chunk_size=65536):
+            )
+            
+            # Start the stream - keep client alive
+            resp = await client.get(decoded_url, headers=headers)
+            logger.info(f"Response: {resp.status_code} from {proxy_ip}")
+            
+            if resp.status_code == 200 or resp.status_code == 206:
+                content_type = resp.headers.get("content-type", "video/mp4")
+                content_length = resp.headers.get("content-length", "")
+                content_range = resp.headers.get("content-range", "")
+                
+                response_headers = {
+                    "Content-Type": content_type,
+                    "Access-Control-Allow-Origin": "*",
+                    "Cache-Control": "public, max-age=3600",
+                    "Accept-Ranges": "bytes",
+                }
+                if content_length:
+                    response_headers["Content-Length"] = content_length
+                if content_range:
+                    response_headers["Content-Range"] = content_range
+                
+                logger.info(f"✅ Success via {proxy_ip}")
+                
+                # The generator keeps the client alive
+                async def stream_generator():
+                    try:
+                        async for chunk in resp.aiter_bytes(chunk_size=65536):
+                            if chunk:
                                 yield chunk
-                        
-                        return StreamingResponse(
-                            stream_generator(),
-                            status_code=200,
-                            media_type=content_type,
-                            headers=response_headers,
-                        )
-                    elif resp.status_code == 403 or resp.status_code == 426:
-                        logger.warning(f"Proxy {proxy_ip} returned {resp.status_code}, marking as dead")
-                        proxy['working'] = False
-                    else:
-                        logger.warning(f"Proxy {proxy_ip} returned {resp.status_code}, trying next...")
-                        
+                    except Exception as e:
+                        logger.error(f"Stream error: {str(e)}")
+                    finally:
+                        await client.aclose()
+                
+                return StreamingResponse(
+                    stream_generator(),
+                    status_code=200,
+                    media_type=content_type,
+                    headers=response_headers,
+                )
+            elif resp.status_code == 403 or resp.status_code == 426:
+                logger.warning(f"Proxy {proxy_ip} returned {resp.status_code}, marking as dead")
+                proxy['working'] = False
+                await client.aclose()
+            else:
+                logger.warning(f"Proxy {proxy_ip} returned {resp.status_code}, trying next...")
+                await client.aclose()
+                    
         except Exception as e:
             logger.error(f"Proxy {proxy_ip} error: {str(e)}")
             proxy['working'] = False
@@ -244,41 +255,50 @@ async def proxy(request: Request, url: str):
     # Direct connection fallback
     logger.info("All proxies failed, trying direct connection...")
     try:
-        async with httpx.AsyncClient(
+        client = httpx.AsyncClient(
             timeout=httpx.Timeout(120.0, connect=15.0),
             follow_redirects=True,
             http2=True,
             limits=httpx.Limits(max_keepalive_connections=1, max_connections=1)
-        ) as client:
-            async with client.stream("GET", decoded_url, headers=headers) as resp:
-                if resp.status_code == 200 or resp.status_code == 206:
-                    content_type = resp.headers.get("content-type", "video/mp4")
-                    content_length = resp.headers.get("content-length", "")
-                    content_range = resp.headers.get("content-range", "")
-                    
-                    response_headers = {
-                        "Content-Type": content_type,
-                        "Access-Control-Allow-Origin": "*",
-                        "Cache-Control": "public, max-age=3600",
-                        "Accept-Ranges": "bytes",
-                    }
-                    if content_length:
-                        response_headers["Content-Length"] = content_length
-                    if content_range:
-                        response_headers["Content-Range"] = content_range
-                    
-                    async def stream_generator():
-                        async for chunk in resp.aiter_bytes(chunk_size=65536):
+        )
+        
+        resp = await client.get(decoded_url, headers=headers)
+        
+        if resp.status_code == 200 or resp.status_code == 206:
+            content_type = resp.headers.get("content-type", "video/mp4")
+            content_length = resp.headers.get("content-length", "")
+            content_range = resp.headers.get("content-range", "")
+            
+            response_headers = {
+                "Content-Type": content_type,
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "public, max-age=3600",
+                "Accept-Ranges": "bytes",
+            }
+            if content_length:
+                response_headers["Content-Length"] = content_length
+            if content_range:
+                response_headers["Content-Range"] = content_range
+            
+            async def stream_generator():
+                try:
+                    async for chunk in resp.aiter_bytes(chunk_size=65536):
+                        if chunk:
                             yield chunk
-                    
-                    return StreamingResponse(
-                        stream_generator(),
-                        status_code=200,
-                        media_type=content_type,
-                        headers=response_headers,
-                    )
-                else:
-                    raise HTTPException(resp.status_code, f"CDN error: {resp.status_code}")
+                except Exception as e:
+                    logger.error(f"Direct stream error: {str(e)}")
+                finally:
+                    await client.aclose()
+            
+            return StreamingResponse(
+                stream_generator(),
+                status_code=200,
+                media_type=content_type,
+                headers=response_headers,
+            )
+        else:
+            await client.aclose()
+            raise HTTPException(resp.status_code, f"CDN error: {resp.status_code}")
                 
     except Exception as e:
         logger.error(f"Direct connection error: {str(e)}")
