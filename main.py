@@ -1,4 +1,4 @@
-# main.py - Pure direct fetch with chunked streaming
+# main.py - Pure direct fetch with chunked streaming (Fixed)
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -100,16 +100,37 @@ def build_headers(token, range_header=None):
     return headers
 
 # ==================== STREAMING ====================
-async def stream_generator(resp):
-    """Stream chunks without buffering - 64KB chunks"""
+async def stream_generator(client, resp):
+    """
+    Stream chunks without buffering while keeping the HTTP client alive.
+    The client and response are kept open until streaming completes.
+    """
+    chunk_size = 65536  # 64KB chunks
     try:
-        chunk_size = 65536
         async for chunk in resp.aiter_bytes(chunk_size=chunk_size):
             if chunk:
                 yield chunk
+    except httpx.StreamClosed as e:
+        # This happens when the remote server closes the connection early
+        logger.warning(f"Stream closed by remote server: {str(e)}")
+        # Return partial content - the client already got what was sent
+        return
+    except httpx.ReadTimeout as e:
+        logger.warning(f"Read timeout during streaming: {str(e)}")
+        return
     except Exception as e:
         logger.error(f"Stream error: {str(e)}")
         raise
+    finally:
+        # Clean up resources
+        try:
+            await resp.aclose()
+        except:
+            pass
+        try:
+            await client.aclose()
+        except:
+            pass
 
 # ==================== ENDPOINTS ====================
 @app.get("/")
@@ -138,71 +159,105 @@ async def proxy(request: Request, url: str):
     range_header = request.headers.get("range")
     headers = build_headers(token, range_header)
 
+    # Create client outside the async with block so we control its lifetime
+    client = None
+    resp = None
+    
     try:
+        # Step 1: Create the HTTP client
         client_kwargs = {
             "timeout": httpx.Timeout(300.0, connect=30.0),
             "follow_redirects": True,
             "http2": True,
             "limits": httpx.Limits(max_keepalive_connections=1, max_connections=1)
         }
+        client = httpx.AsyncClient(**client_kwargs)
         
-        async with httpx.AsyncClient(**client_kwargs) as client:
-            async with client.stream("GET", decoded_url, headers=headers) as resp:
-                logger.info(f"📊 CDN response: {resp.status_code}")
+        # Step 2: Start the streaming request (don't use async with yet)
+        resp = await client.stream("GET", decoded_url, headers=headers)
+        
+        # Step 3: Enter the response context
+        await resp.__aenter__()
+        
+        logger.info(f"📊 CDN response: {resp.status_code}")
+        
+        # Handle 426 Upgrade Required (HTTP/2 to HTTP/1.1 fallback)
+        if resp.status_code == 426:
+            logger.warning("⚠️ 426 Upgrade Required, trying HTTP/1.1...")
+            
+            # Close the old connection
+            await resp.aclose()
+            await client.aclose()
+            
+            # Create new client with HTTP/1.1
+            client = httpx.AsyncClient(
+                timeout=httpx.Timeout(300.0, connect=30.0),
+                follow_redirects=True,
+                http2=False,
+            )
+            resp = await client.stream("GET", decoded_url, headers=headers)
+            await resp.__aenter__()
+        
+        # Check for error status codes
+        if resp.status_code not in (200, 206):
+            error_body = await resp.aread()
+            error_text = error_body.decode('utf-8', errors='ignore')[:200]
+            logger.error(f"❌ CDN error {resp.status_code}: {error_text}")
+            await resp.aclose()
+            await client.aclose()
+            raise HTTPException(resp.status_code, f"CDN error: {resp.status_code}")
+        
+        # Prepare headers for the response
+        content_type = resp.headers.get("content-type", "video/mp4")
+        content_length = resp.headers.get("content-length")
+        content_range = resp.headers.get("content-range")
+        
+        response_headers = {
+            "Content-Type": content_type,
+            "Access-Control-Allow-Origin": "*",
+            "Cache-Control": "public, max-age=3600",
+            "Accept-Ranges": "bytes",
+        }
+        
+        # Forward Content-Length only for range responses
+        if range_header and content_length:
+            response_headers["Content-Length"] = content_length
+        if content_range:
+            response_headers["Content-Range"] = content_range
+        
+        status_code = 206 if range_header else 200
+        
+        logger.info(f"✅ Streaming started (status: {status_code})")
+        
+        # Return StreamingResponse with the generator that keeps client alive
+        return StreamingResponse(
+            stream_generator(client, resp),
+            status_code=status_code,
+            media_type=content_type,
+            headers=response_headers,
+        )
                 
-                # Handle 426 Upgrade Required
-                if resp.status_code == 426:
-                    logger.warning("⚠️ 426 Upgrade Required, trying HTTP/1.1...")
-                    async with httpx.AsyncClient(
-                        timeout=httpx.Timeout(300.0, connect=30.0),
-                        follow_redirects=True,
-                        http2=False,
-                    ) as client_http1:
-                        async with client_http1.stream("GET", decoded_url, headers=headers) as resp2:
-                            return await handle_response(resp2, range_header)
-                
-                if resp.status_code != 200 and resp.status_code != 206:
-                    error_body = await resp.aread()
-                    logger.error(f"❌ CDN error: {resp.status_code}")
-                    raise HTTPException(resp.status_code, f"CDN error: {resp.status_code}")
-                
-                return await handle_response(resp, range_header)
-                
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
     except Exception as e:
         logger.error(f"❌ Proxy error: {str(e)}")
+        # Clean up if there was an error
+        if resp:
+            try:
+                await resp.aclose()
+            except:
+                pass
+        if client:
+            try:
+                await client.aclose()
+            except:
+                pass
         raise HTTPException(500, f"Proxy error: {str(e)}")
-
-async def handle_response(resp, range_header):
-    content_type = resp.headers.get("content-type", "video/mp4")
-    content_length = resp.headers.get("content-length")
-    content_range = resp.headers.get("content-range")
-    
-    response_headers = {
-        "Content-Type": content_type,
-        "Access-Control-Allow-Origin": "*",
-        "Cache-Control": "public, max-age=3600",
-        "Accept-Ranges": "bytes",
-    }
-    
-    # Only forward Content-Length if it's a range response
-    if range_header and content_length:
-        response_headers["Content-Length"] = content_length
-    if content_range:
-        response_headers["Content-Range"] = content_range
-    
-    status_code = 206 if range_header else 200
-    
-    logger.info(f"✅ Streaming started (status: {status_code})")
-    
-    return StreamingResponse(
-        stream_generator(resp),
-        status_code=status_code,
-        media_type=content_type,
-        headers=response_headers,
-    )
 
 @app.on_event("shutdown")
 async def shutdown():
+    # Clean shutdown - nothing needed here as clients are cleaned up per request
     pass
 
 if __name__ == "__main__":
