@@ -1,4 +1,4 @@
-# main.py - Pure direct fetch with chunked streaming (Fixed)
+# main.py - Pure direct fetch with chunked streaming (FIXED)
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -173,11 +173,10 @@ async def proxy(request: Request, url: str):
         }
         client = httpx.AsyncClient(**client_kwargs)
         
-        # Step 2: Start the streaming request (don't use async with yet)
-        resp = await client.stream("GET", decoded_url, headers=headers)
-        
-        # Step 3: Enter the response context
-        await resp.__aenter__()
+        # Step 2: Start the streaming request using async with but keep it open
+        # We use __aenter__ and __aexit__ manually to control the lifecycle
+        resp_context = client.stream("GET", decoded_url, headers=headers)
+        resp = await resp_context.__aenter__()
         
         logger.info(f"📊 CDN response: {resp.status_code}")
         
@@ -186,7 +185,7 @@ async def proxy(request: Request, url: str):
             logger.warning("⚠️ 426 Upgrade Required, trying HTTP/1.1...")
             
             # Close the old connection
-            await resp.aclose()
+            await resp_context.__aexit__(None, None, None)
             await client.aclose()
             
             # Create new client with HTTP/1.1
@@ -195,15 +194,15 @@ async def proxy(request: Request, url: str):
                 follow_redirects=True,
                 http2=False,
             )
-            resp = await client.stream("GET", decoded_url, headers=headers)
-            await resp.__aenter__()
+            resp_context = client.stream("GET", decoded_url, headers=headers)
+            resp = await resp_context.__aenter__()
         
         # Check for error status codes
         if resp.status_code not in (200, 206):
             error_body = await resp.aread()
             error_text = error_body.decode('utf-8', errors='ignore')[:200]
             logger.error(f"❌ CDN error {resp.status_code}: {error_text}")
-            await resp.aclose()
+            await resp_context.__aexit__(None, None, None)
             await client.aclose()
             raise HTTPException(resp.status_code, f"CDN error: {resp.status_code}")
         
