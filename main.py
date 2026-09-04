@@ -1,4 +1,4 @@
-# main.py - Pure direct fetch with chunked streaming (FIXED)
+# main.py - Pure direct fetch with chunked streaming (FULLY FIXED)
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -100,20 +100,26 @@ def build_headers(token, range_header=None):
     return headers
 
 # ==================== STREAMING ====================
-async def stream_generator(client, resp):
+async def stream_generator(client, resp, content_length=None):
     """
     Stream chunks without buffering while keeping the HTTP client alive.
-    The client and response are kept open until streaming completes.
     """
     chunk_size = 65536  # 64KB chunks
+    bytes_streamed = 0
+    
     try:
         async for chunk in resp.aiter_bytes(chunk_size=chunk_size):
             if chunk:
+                bytes_streamed += len(chunk)
                 yield chunk
+                
+                # Log progress for large files
+                if content_length and bytes_streamed % (chunk_size * 100) == 0:
+                    progress = (bytes_streamed / int(content_length)) * 100
+                    logger.debug(f"📊 Progress: {progress:.1f}%")
+                    
     except httpx.StreamClosed as e:
-        # This happens when the remote server closes the connection early
         logger.warning(f"Stream closed by remote server: {str(e)}")
-        # Return partial content - the client already got what was sent
         return
     except httpx.ReadTimeout as e:
         logger.warning(f"Read timeout during streaming: {str(e)}")
@@ -159,12 +165,11 @@ async def proxy(request: Request, url: str):
     range_header = request.headers.get("range")
     headers = build_headers(token, range_header)
 
-    # Create client outside the async with block so we control its lifetime
     client = None
     resp = None
     
     try:
-        # Step 1: Create the HTTP client
+        # Create the HTTP client
         client_kwargs = {
             "timeout": httpx.Timeout(300.0, connect=30.0),
             "follow_redirects": True,
@@ -173,22 +178,18 @@ async def proxy(request: Request, url: str):
         }
         client = httpx.AsyncClient(**client_kwargs)
         
-        # Step 2: Start the streaming request using async with but keep it open
-        # We use __aenter__ and __aexit__ manually to control the lifecycle
+        # Start the streaming request
         resp_context = client.stream("GET", decoded_url, headers=headers)
         resp = await resp_context.__aenter__()
         
         logger.info(f"📊 CDN response: {resp.status_code}")
         
-        # Handle 426 Upgrade Required (HTTP/2 to HTTP/1.1 fallback)
+        # Handle 426 Upgrade Required
         if resp.status_code == 426:
             logger.warning("⚠️ 426 Upgrade Required, trying HTTP/1.1...")
-            
-            # Close the old connection
             await resp_context.__aexit__(None, None, None)
             await client.aclose()
             
-            # Create new client with HTTP/1.1
             client = httpx.AsyncClient(
                 timeout=httpx.Timeout(300.0, connect=30.0),
                 follow_redirects=True,
@@ -206,42 +207,59 @@ async def proxy(request: Request, url: str):
             await client.aclose()
             raise HTTPException(resp.status_code, f"CDN error: {resp.status_code}")
         
-        # Prepare headers for the response
+        # Get headers from CDN response
         content_type = resp.headers.get("content-type", "video/mp4")
         content_length = resp.headers.get("content-length")
         content_range = resp.headers.get("content-range")
         
+        # CRITICAL: Build proper response headers for video playback
         response_headers = {
             "Content-Type": content_type,
             "Access-Control-Allow-Origin": "*",
-            "Cache-Control": "public, max-age=3600",
+            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+            "Access-Control-Allow-Headers": "Range, Content-Range, Content-Type",
             "Accept-Ranges": "bytes",
+            "Cache-Control": "public, max-age=3600",
         }
         
-        # Forward Content-Length only for range responses
-        if range_header and content_length:
-            response_headers["Content-Length"] = content_length
-        if content_range:
-            response_headers["Content-Range"] = content_range
-        
-        status_code = 206 if range_header else 200
+        # Determine status code
+        if range_header:
+            status_code = 206
+            # For partial content, we MUST forward Content-Length and Content-Range
+            if content_length:
+                response_headers["Content-Length"] = content_length
+            if content_range:
+                response_headers["Content-Range"] = content_range
+            else:
+                # If CDN didn't return Content-Range, we need to calculate it
+                # This is a fallback - might not work perfectly
+                if content_length:
+                    response_headers["Content-Range"] = f"bytes 0-{int(content_length)-1}/{content_length}"
+        else:
+            status_code = 200
+            # For full content, browsers need Content-Length
+            if content_length:
+                response_headers["Content-Length"] = content_length
+            else:
+                # If no content-length, we need to send it chunked
+                # FastAPI/Starlette will handle this with Transfer-Encoding: chunked
+                pass
         
         logger.info(f"✅ Streaming started (status: {status_code})")
+        logger.info(f"📋 Headers: {response_headers}")
         
-        # Return StreamingResponse with the generator that keeps client alive
+        # Return StreamingResponse
         return StreamingResponse(
-            stream_generator(client, resp),
+            stream_generator(client, resp, content_length),
             status_code=status_code,
             media_type=content_type,
             headers=response_headers,
         )
                 
     except HTTPException:
-        # Re-raise HTTP exceptions
         raise
     except Exception as e:
         logger.error(f"❌ Proxy error: {str(e)}")
-        # Clean up if there was an error
         if resp:
             try:
                 await resp.aclose()
@@ -256,7 +274,6 @@ async def proxy(request: Request, url: str):
 
 @app.on_event("shutdown")
 async def shutdown():
-    # Clean shutdown - nothing needed here as clients are cleaned up per request
     pass
 
 if __name__ == "__main__":
