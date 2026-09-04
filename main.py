@@ -1,6 +1,6 @@
-# main.py - MovieBox Proxy with /play/ endpoint for browser video playback
+# main.py - MovieBox Proxy with query parameter video playback
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse, HTMLResponse
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import re
@@ -23,7 +23,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ==================== TOKEN CACHE ==================
+# ==================== TOKEN CACHE ====================
 cached_token = None
 token_expiry = 0
 
@@ -138,9 +138,79 @@ async def stream_generator(client, resp, content_length=None):
         except:
             pass
 
-# ==================== PROXY LOGIC ====================
-async def proxy_video(request: Request, decoded_url: str, is_play_endpoint: bool = False):
-    """Shared logic for proxying video streams"""
+# ==================== ENDPOINTS ====================
+@app.get("/")
+async def proxy_video(request: Request, url: str):
+    """
+    Root endpoint - directly streams video when ?url= is provided
+    Usage: /?url=ENCODED_VIDEO_URL
+    """
+    if not url:
+        # If no URL, return simple HTML player
+        html_content = """
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>MovieBox Proxy</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <style>
+                body { margin: 0; background: #000; display: flex; justify-content: center; align-items: center; height: 100vh; flex-direction: column; font-family: Arial; color: white; }
+                video { max-width: 100%; max-height: 80vh; }
+                .info { margin-top: 20px; font-size: 12px; opacity: 0.6; text-align: center; padding: 0 20px; }
+                input { padding: 10px; width: 80%; max-width: 500px; margin: 10px; border-radius: 5px; border: 1px solid #444; background: #222; color: white; }
+                button { padding: 10px 30px; border-radius: 5px; border: none; background: #4CAF50; color: white; cursor: pointer; }
+                .container { width: 100%; max-width: 600px; text-align: center; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h2>🎬 MovieBox Proxy</h2>
+                <p>Enter video URL to play:</p>
+                <input type="text" id="videoUrl" placeholder="https://example.com/video.mp4" value="https://bcdnxw.hakunaymatata.com/bt/610a2ec52137bb1340e42c9ce19fd736.mp4?sign=d4cd9bc4931b9c8819cdf2d8a3db6d88&t=1788554194">
+                <br>
+                <button onclick="playVideo()">▶ Play Video</button>
+                <div id="playerContainer" style="margin-top: 20px; display: none;">
+                    <video controls autoplay id="videoPlayer">
+                        <source src="" type="video/mp4">
+                        Your browser does not support the video tag.
+                    </video>
+                </div>
+            </div>
+            <script>
+                function playVideo() {
+                    const url = document.getElementById('videoUrl').value;
+                    if (!url) {
+                        alert('Please enter a URL');
+                        return;
+                    }
+                    const container = document.getElementById('playerContainer');
+                    const video = document.getElementById('videoPlayer');
+                    const source = video.querySelector('source');
+                    
+                    // Use the proxy with the encoded URL
+                    source.src = '/?url=' + encodeURIComponent(url);
+                    video.load();
+                    container.style.display = 'block';
+                    
+                    // Scroll to player
+                    container.scrollIntoView({ behavior: 'smooth' });
+                }
+                
+                // Auto-play if URL in query
+                const urlParams = new URLSearchParams(window.location.search);
+                const urlParam = urlParams.get('url');
+                if (urlParam) {
+                    document.getElementById('videoUrl').value = decodeURIComponent(urlParam);
+                    playVideo();
+                }
+            </script>
+        </body>
+        </html>
+        """
+        return HTMLResponse(content=html_content)
+    
+    # If URL is provided, stream the video directly
+    decoded_url = unquote(url)
     logger.info(f"📥 Fetching: {decoded_url}")
 
     token = await get_fresh_token()
@@ -200,16 +270,13 @@ async def proxy_video(request: Request, decoded_url: str, is_play_endpoint: bool
         # Build proper response headers for video playback
         response_headers = {
             "Content-Type": content_type,
+            "Content-Disposition": "inline",
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
             "Access-Control-Allow-Headers": "Range, Content-Range, Content-Type",
             "Accept-Ranges": "bytes",
             "Cache-Control": "public, max-age=3600",
         }
-        
-        # Add Content-Disposition for /play/ endpoint to force inline playback
-        if is_play_endpoint:
-            response_headers["Content-Disposition"] = "inline"
         
         # Determine status code
         if range_header:
@@ -249,96 +316,6 @@ async def proxy_video(request: Request, decoded_url: str, is_play_endpoint: bool
             except:
                 pass
         raise HTTPException(500, f"Proxy error: {str(e)}")
-
-# ==================== ENDPOINTS ====================
-@app.get("/")
-async def root():
-    """Simple HTML video player for easy testing"""
-    html_content = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>MovieBox Proxy Player</title>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <style>
-            body {
-                margin: 0;
-                background: #000;
-                display: flex;
-                flex-direction: column;
-                justify-content: center;
-                align-items: center;
-                height: 100vh;
-                font-family: Arial, sans-serif;
-                color: white;
-            }
-            video {
-                max-width: 100%;
-                max-height: 80vh;
-                background: #000;
-            }
-            .info {
-                margin-top: 20px;
-                font-size: 14px;
-                opacity: 0.7;
-                text-align: center;
-                padding: 0 20px;
-            }
-            .info a {
-                color: #4CAF50;
-                text-decoration: none;
-            }
-        </style>
-    </head>
-    <body>
-        <video controls autoplay>
-            <source src="" type="video/mp4" id="videoSource">
-            Your browser does not support the video tag.
-        </video>
-        <div class="info">
-            <p>Use <code>/play/ENCODED_URL</code> for native player</p>
-            <p>Example: <a href="#" id="exampleLink">/play/https%3A%2F%2Fexample.com%2Fvideo.mp4</a></p>
-        </div>
-        <script>
-            // Get video URL from query parameter or use default example
-            const urlParams = new URLSearchParams(window.location.search);
-            let videoUrl = urlParams.get('url');
-            
-            if (videoUrl) {
-                document.getElementById('videoSource').src = '/play/' + encodeURIComponent(videoUrl);
-                document.querySelector('video').load();
-            } else {
-                // Show example link
-                const exampleUrl = 'https%3A%2F%2Fbcdnxw.hakunaymatata.com%2Fbt%2F610a2ec52137bb1340e42c9ce19fd736.mp4%3Fsign%3Dd4cd9bc4931b9c8819cdf2d8a3db6d88%26t%3D1788554194';
-                document.getElementById('exampleLink').href = '/play/' + exampleUrl;
-                document.getElementById('exampleLink').textContent = '/play/' + exampleUrl;
-            }
-        </script>
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html_content)
-
-@app.get("/proxy")
-async def proxy(request: Request, url: str):
-    """Legacy proxy endpoint - kept for backward compatibility"""
-    if not url:
-        raise HTTPException(400, "Missing url parameter")
-    
-    decoded_url = unquote(url)
-    return await proxy_video(request, decoded_url, is_play_endpoint=False)
-
-@app.get("/play/{encoded_url:path}")
-async def play_video(request: Request, encoded_url: str):
-    """
-    Video playback endpoint - browser will open native player
-    Usage: /play/ENCODED_URL
-    """
-    if not encoded_url:
-        raise HTTPException(400, "Missing url parameter")
-    
-    decoded_url = unquote(encoded_url)
-    return await proxy_video(request, decoded_url, is_play_endpoint=True)
 
 @app.on_event("shutdown")
 async def shutdown():
