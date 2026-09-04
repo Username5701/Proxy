@@ -1,4 +1,4 @@
-# main.py - Railway with byte-range streaming and proxy rotation
+# main.py - Pure direct fetch with chunked streaming
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,7 +10,6 @@ import os
 from urllib.parse import unquote
 import base64
 import time
-import random
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -24,64 +23,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ==================== PROXY CONFIGURATION ====================
-PROXY_SOURCES = [
-    "https://databay.com/free-proxy-list/http.txt",
-    "https://databay.com/api/v1/proxy-list?ssl=strict&protocol=http&format=json&limit=100",
-]
-
-proxy_pool = []
-last_refresh = 0
-PROXY_REFRESH_INTERVAL = 300
-MAX_PROXY_ATTEMPTS = 20
-
-async def refresh_proxy_pool():
-    global proxy_pool, last_refresh
-    
-    if time.time() - last_refresh < PROXY_REFRESH_INTERVAL:
-        logger.info(f"Using cached proxy pool ({len(proxy_pool)} proxies)")
-        return
-    
-    logger.info("🔄 Fetching fresh proxies from Databay...")
-    new_proxies = []
-    
-    for source in PROXY_SOURCES:
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.get(source)
-                if resp.status_code == 200:
-                    if source.endswith('.txt'):
-                        lines = resp.text.strip().split('\n')
-                        for line in lines:
-                            line = line.strip()
-                            if line and not line.startswith('#'):
-                                parts = line.split(':')
-                                if len(parts) == 2:
-                                    proxy = f"http://{parts[0]}:{parts[1]}"
-                                    if proxy not in new_proxies:
-                                        new_proxies.append(proxy)
-                        logger.info(f"✅ Fetched {len(new_proxies)} proxies from Databay file")
-                    else:
-                        data = resp.json()
-                        for p in data.get("data", []):
-                            proxy = f"http://{p['ip']}:{p['port']}"
-                            if proxy not in new_proxies:
-                                new_proxies.append(proxy)
-                        logger.info(f"✅ Fetched {len(new_proxies)} proxies from Databay API")
-                else:
-                    logger.warning(f"Source returned {resp.status_code}")
-        except Exception as e:
-            logger.error(f"Error fetching from {source[:50]}: {str(e)[:50]}")
-    
-    if new_proxies:
-        random.shuffle(new_proxies)
-        proxy_pool = new_proxies[:200]
-        last_refresh = time.time()
-        logger.info(f"✅ Proxy pool updated: {len(proxy_pool)} proxies")
-    else:
-        logger.warning("⚠️ No proxies fetched, keeping existing pool")
-
-# ==================== TOKEN MANAGEMENT ====================
+# ==================== TOKEN CACHE ====================
 cached_token = None
 token_expiry = 0
 
@@ -153,65 +95,15 @@ def build_headers(token, range_header=None):
     
     if range_header:
         headers["Range"] = range_header
-        logger.info(f"📊 Range header added: {range_header}")
+        logger.info(f"📊 Range header: {range_header}")
     
     return headers
 
-# ==================== PROXY TESTING ====================
-async def test_proxy(proxy_url, test_url, headers):
-    """Test a proxy using HEAD request"""
-    try:
-        async with httpx.AsyncClient(
-            proxies=proxy_url,
-            timeout=httpx.Timeout(5.0, connect=3.0),
-            follow_redirects=True,
-            http2=False
-        ) as client:
-            resp = await client.head(test_url, headers=headers)
-            return resp.status_code in [200, 206, 403, 404]
-    except Exception as e:
-        return False
-
-async def get_working_proxy(headers, url, max_attempts=MAX_PROXY_ATTEMPTS):
-    global proxy_pool
-    
-    if not proxy_pool:
-        await refresh_proxy_pool()
-    
-    if not proxy_pool:
-        return None
-    
-    test_pool = proxy_pool.copy()
-    tested = 0
-    
-    while test_pool and tested < max_attempts:
-        proxy_url = random.choice(test_pool)
-        test_pool.remove(proxy_url)
-        tested += 1
-        
-        logger.info(f"Testing proxy {tested}/{max_attempts}: {proxy_url[:40]}...")
-        
-        is_working = await test_proxy(proxy_url, url, headers)
-        
-        if is_working:
-            logger.info(f"✅ Found working proxy: {proxy_url[:40]}...")
-            if proxy_url in proxy_pool:
-                proxy_pool.remove(proxy_url)
-                proxy_pool.insert(0, proxy_url)
-            return proxy_url
-        else:
-            if proxy_url in proxy_pool:
-                proxy_pool.remove(proxy_url)
-                logger.info(f"❌ Proxy failed: {proxy_url[:40]}...")
-    
-    logger.info(f"No working proxy found after {tested} attempts")
-    return None
-
-# ==================== STREAMING HELPER ====================
+# ==================== STREAMING ====================
 async def stream_generator(resp):
-    """Stream chunks without buffering"""
+    """Stream chunks without buffering - 64KB chunks"""
     try:
-        chunk_size = 65536  # 64KB chunks for memory efficiency
+        chunk_size = 65536
         async for chunk in resp.aiter_bytes(chunk_size=chunk_size):
             if chunk:
                 yield chunk
@@ -220,41 +112,15 @@ async def stream_generator(resp):
         raise
 
 # ==================== ENDPOINTS ====================
-@app.on_event("startup")
-async def startup_event():
-    logger.info("🔄 Pre-filling proxy pool from Databay...")
-    await refresh_proxy_pool()
-    logger.info(f"✅ Proxy pool ready: {len(proxy_pool)} proxies")
-
 @app.get("/")
 async def root():
     return {
         "service": "MovieBox Proxy (Railway)",
         "status": "running",
-        "proxy_pool_size": len(proxy_pool),
         "endpoints": {
-            "/proxy": "Proxy video stream with byte-range support",
-            "/refresh_proxies": "Force refresh proxy pool",
-            "/proxies": "List available proxies"
-        }
-    }
-
-@app.get("/proxies")
-async def list_proxies():
-    return {
-        "total": len(proxy_pool),
-        "proxies": [p[:40] + "..." for p in proxy_pool[:20]]
-    }
-
-@app.get("/refresh_proxies")
-async def refresh_proxies():
-    global proxy_pool, last_refresh
-    proxy_pool = []
-    last_refresh = 0
-    await refresh_proxy_pool()
-    return {
-        "status": "refreshed",
-        "proxy_pool_size": len(proxy_pool)
+            "/proxy": "Proxy video stream from CDN"
+        },
+        "usage": "/proxy?url=ENCODED_CDN_URL"
     }
 
 @app.get("/proxy")
@@ -272,26 +138,13 @@ async def proxy(request: Request, url: str):
     range_header = request.headers.get("range")
     headers = build_headers(token, range_header)
 
-    # Find working proxy
-    proxy_url = await get_working_proxy(headers, decoded_url, max_attempts=MAX_PROXY_ATTEMPTS)
-    
-    if proxy_url:
-        logger.info(f"✅ Using working proxy: {proxy_url[:40]}...")
-    else:
-        logger.info("⚠️ No working proxy found, trying direct connection")
-    
     try:
         client_kwargs = {
-            "timeout": httpx.Timeout(300.0, connect=15.0),
+            "timeout": httpx.Timeout(300.0, connect=30.0),
             "follow_redirects": True,
+            "http2": True,
             "limits": httpx.Limits(max_keepalive_connections=1, max_connections=1)
         }
-        
-        if proxy_url:
-            client_kwargs["proxies"] = proxy_url
-            client_kwargs["http2"] = False
-        else:
-            client_kwargs["http2"] = True
         
         async with httpx.AsyncClient(**client_kwargs) as client:
             async with client.stream("GET", decoded_url, headers=headers) as resp:
@@ -301,32 +154,29 @@ async def proxy(request: Request, url: str):
                 if resp.status_code == 426:
                     logger.warning("⚠️ 426 Upgrade Required, trying HTTP/1.1...")
                     async with httpx.AsyncClient(
-                        timeout=httpx.Timeout(300.0, connect=15.0),
+                        timeout=httpx.Timeout(300.0, connect=30.0),
                         follow_redirects=True,
                         http2=False,
-                        proxies=proxy_url if proxy_url else None
                     ) as client_http1:
                         async with client_http1.stream("GET", decoded_url, headers=headers) as resp2:
-                            return await handle_cdn_response(resp2, range_header)
+                            return await handle_response(resp2, range_header)
                 
-                return await handle_cdn_response(resp, range_header)
+                if resp.status_code != 200 and resp.status_code != 206:
+                    error_body = await resp.aread()
+                    logger.error(f"❌ CDN error: {resp.status_code}")
+                    raise HTTPException(resp.status_code, f"CDN error: {resp.status_code}")
+                
+                return await handle_response(resp, range_header)
                 
     except Exception as e:
         logger.error(f"❌ Proxy error: {str(e)}")
         raise HTTPException(500, f"Proxy error: {str(e)}")
 
-async def handle_cdn_response(resp, range_header):
-    """Handle CDN response with proper byte-range support"""
-    if resp.status_code != 200 and resp.status_code != 206:
-        error_body = await resp.aread()
-        logger.error(f"❌ CDN error: {resp.status_code}")
-        raise HTTPException(resp.status_code, f"CDN error: {resp.status_code}")
-    
+async def handle_response(resp, range_header):
     content_type = resp.headers.get("content-type", "video/mp4")
     content_length = resp.headers.get("content-length")
     content_range = resp.headers.get("content-range")
     
-    # Build response headers
     response_headers = {
         "Content-Type": content_type,
         "Access-Control-Allow-Origin": "*",
@@ -334,15 +184,15 @@ async def handle_cdn_response(resp, range_header):
         "Accept-Ranges": "bytes",
     }
     
-    if content_length:
+    # Only forward Content-Length if it's a range response
+    if range_header and content_length:
         response_headers["Content-Length"] = content_length
     if content_range:
         response_headers["Content-Range"] = content_range
     
-    # Use 206 for partial content (seeking), 200 for full content
     status_code = 206 if range_header else 200
     
-    logger.info(f"✅ Streaming started (status: {status_code}, range: {range_header or 'full'})")
+    logger.info(f"✅ Streaming started (status: {status_code})")
     
     return StreamingResponse(
         stream_generator(resp),
