@@ -1,4 +1,4 @@
-# main.py - Railway proxy with Databay proxy rotation (MEMORY OPTIMIZED)
+# main.py - Railway with byte-range streaming and proxy rotation
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,7 +33,7 @@ PROXY_SOURCES = [
 proxy_pool = []
 last_refresh = 0
 PROXY_REFRESH_INTERVAL = 300
-MAX_PROXY_ATTEMPTS = 30
+MAX_PROXY_ATTEMPTS = 20
 
 async def refresh_proxy_pool():
     global proxy_pool, last_refresh
@@ -153,12 +153,13 @@ def build_headers(token, range_header=None):
     
     if range_header:
         headers["Range"] = range_header
+        logger.info(f"📊 Range header added: {range_header}")
     
     return headers
 
-# ==================== PROXY TESTING (NO RANGE HEADER) ====================
+# ==================== PROXY TESTING ====================
 async def test_proxy(proxy_url, test_url, headers):
-    """Test a proxy using simple HEAD request (no range to avoid memory issues)"""
+    """Test a proxy using HEAD request"""
     try:
         async with httpx.AsyncClient(
             proxies=proxy_url,
@@ -167,7 +168,7 @@ async def test_proxy(proxy_url, test_url, headers):
             http2=False
         ) as client:
             resp = await client.head(test_url, headers=headers)
-            return resp.status_code in [200, 206, 403, 404]  # Accept 403 as "proxy works but CDN blocks"
+            return resp.status_code in [200, 206, 403, 404]
     except Exception as e:
         return False
 
@@ -206,6 +207,18 @@ async def get_working_proxy(headers, url, max_attempts=MAX_PROXY_ATTEMPTS):
     logger.info(f"No working proxy found after {tested} attempts")
     return None
 
+# ==================== STREAMING HELPER ====================
+async def stream_generator(resp):
+    """Stream chunks without buffering"""
+    try:
+        chunk_size = 65536  # 64KB chunks for memory efficiency
+        async for chunk in resp.aiter_bytes(chunk_size=chunk_size):
+            if chunk:
+                yield chunk
+    except Exception as e:
+        logger.error(f"Stream error: {str(e)}")
+        raise
+
 # ==================== ENDPOINTS ====================
 @app.on_event("startup")
 async def startup_event():
@@ -220,7 +233,7 @@ async def root():
         "status": "running",
         "proxy_pool_size": len(proxy_pool),
         "endpoints": {
-            "/proxy": "Proxy video stream from CDN",
+            "/proxy": "Proxy video stream with byte-range support",
             "/refresh_proxies": "Force refresh proxy pool",
             "/proxies": "List available proxies"
         }
@@ -258,9 +271,8 @@ async def proxy(request: Request, url: str):
 
     range_header = request.headers.get("range")
     headers = build_headers(token, range_header)
-    if range_header:
-        logger.info(f"📊 Range request: {range_header}")
 
+    # Find working proxy
     proxy_url = await get_working_proxy(headers, decoded_url, max_attempts=MAX_PROXY_ATTEMPTS)
     
     if proxy_url:
@@ -270,7 +282,7 @@ async def proxy(request: Request, url: str):
     
     try:
         client_kwargs = {
-            "timeout": httpx.Timeout(300.0, connect=15.0),  # Increased timeout
+            "timeout": httpx.Timeout(300.0, connect=15.0),
             "follow_redirects": True,
             "limits": httpx.Limits(max_keepalive_connections=1, max_connections=1)
         }
@@ -285,42 +297,59 @@ async def proxy(request: Request, url: str):
             async with client.stream("GET", decoded_url, headers=headers) as resp:
                 logger.info(f"📊 CDN response: {resp.status_code}")
                 
-                if resp.status_code != 200 and resp.status_code != 206:
-                    error_body = await resp.aread()
-                    logger.error(f"❌ CDN error: {resp.status_code}")
-                    raise HTTPException(resp.status_code, f"CDN error: {resp.status_code}")
+                # Handle 426 Upgrade Required
+                if resp.status_code == 426:
+                    logger.warning("⚠️ 426 Upgrade Required, trying HTTP/1.1...")
+                    async with httpx.AsyncClient(
+                        timeout=httpx.Timeout(300.0, connect=15.0),
+                        follow_redirects=True,
+                        http2=False,
+                        proxies=proxy_url if proxy_url else None
+                    ) as client_http1:
+                        async with client_http1.stream("GET", decoded_url, headers=headers) as resp2:
+                            return await handle_cdn_response(resp2, range_header)
                 
-                content_type = resp.headers.get("content-type", "video/mp4")
-                
-                response_headers = {
-                    "Content-Type": content_type,
-                    "Access-Control-Allow-Origin": "*",
-                    "Cache-Control": "public, max-age=3600",
-                    "Accept-Ranges": "bytes",
-                }
-                
-                # Don't forward Content-Length to avoid memory issues
-                logger.info(f"✅ Streaming started (chunked)")
-                
-                async def stream_generator():
-                    try:
-                        # Smaller chunk size for memory efficiency
-                        async for chunk in resp.aiter_bytes(chunk_size=16384):
-                            if chunk:
-                                yield chunk
-                    except Exception as e:
-                        logger.error(f"Stream error: {str(e)}")
-                
-                return StreamingResponse(
-                    stream_generator(),
-                    status_code=200,
-                    media_type=content_type,
-                    headers=response_headers,
-                )
+                return await handle_cdn_response(resp, range_header)
                 
     except Exception as e:
         logger.error(f"❌ Proxy error: {str(e)}")
         raise HTTPException(500, f"Proxy error: {str(e)}")
+
+async def handle_cdn_response(resp, range_header):
+    """Handle CDN response with proper byte-range support"""
+    if resp.status_code != 200 and resp.status_code != 206:
+        error_body = await resp.aread()
+        logger.error(f"❌ CDN error: {resp.status_code}")
+        raise HTTPException(resp.status_code, f"CDN error: {resp.status_code}")
+    
+    content_type = resp.headers.get("content-type", "video/mp4")
+    content_length = resp.headers.get("content-length")
+    content_range = resp.headers.get("content-range")
+    
+    # Build response headers
+    response_headers = {
+        "Content-Type": content_type,
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "public, max-age=3600",
+        "Accept-Ranges": "bytes",
+    }
+    
+    if content_length:
+        response_headers["Content-Length"] = content_length
+    if content_range:
+        response_headers["Content-Range"] = content_range
+    
+    # Use 206 for partial content (seeking), 200 for full content
+    status_code = 206 if range_header else 200
+    
+    logger.info(f"✅ Streaming started (status: {status_code}, range: {range_header or 'full'})")
+    
+    return StreamingResponse(
+        stream_generator(resp),
+        status_code=status_code,
+        media_type=content_type,
+        headers=response_headers,
+    )
 
 @app.on_event("shutdown")
 async def shutdown():
