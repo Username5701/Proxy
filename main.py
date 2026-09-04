@@ -1,6 +1,6 @@
-# main.py - Pure direct fetch with chunked streaming (FULLY FIXED)
+# main.py - MovieBox Proxy with /play/ endpoint for browser video playback
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 import re
@@ -138,24 +138,9 @@ async def stream_generator(client, resp, content_length=None):
         except:
             pass
 
-# ==================== ENDPOINTS ====================
-@app.get("/")
-async def root():
-    return {
-        "service": "MovieBox Proxy (Railway)",
-        "status": "running",
-        "endpoints": {
-            "/proxy": "Proxy video stream from CDN"
-        },
-        "usage": "/proxy?url=ENCODED_CDN_URL"
-    }
-
-@app.get("/proxy")
-async def proxy(request: Request, url: str):
-    if not url:
-        raise HTTPException(400, "Missing url parameter")
-    
-    decoded_url = unquote(url)
+# ==================== PROXY LOGIC ====================
+async def proxy_video(request: Request, decoded_url: str, is_play_endpoint: bool = False):
+    """Shared logic for proxying video streams"""
     logger.info(f"📥 Fetching: {decoded_url}")
 
     token = await get_fresh_token()
@@ -212,7 +197,7 @@ async def proxy(request: Request, url: str):
         content_length = resp.headers.get("content-length")
         content_range = resp.headers.get("content-range")
         
-        # CRITICAL: Build proper response headers for video playback
+        # Build proper response headers for video playback
         response_headers = {
             "Content-Type": content_type,
             "Access-Control-Allow-Origin": "*",
@@ -222,28 +207,21 @@ async def proxy(request: Request, url: str):
             "Cache-Control": "public, max-age=3600",
         }
         
+        # Add Content-Disposition for /play/ endpoint to force inline playback
+        if is_play_endpoint:
+            response_headers["Content-Disposition"] = "inline"
+        
         # Determine status code
         if range_header:
             status_code = 206
-            # For partial content, we MUST forward Content-Length and Content-Range
             if content_length:
                 response_headers["Content-Length"] = content_length
             if content_range:
                 response_headers["Content-Range"] = content_range
-            else:
-                # If CDN didn't return Content-Range, we need to calculate it
-                # This is a fallback - might not work perfectly
-                if content_length:
-                    response_headers["Content-Range"] = f"bytes 0-{int(content_length)-1}/{content_length}"
         else:
             status_code = 200
-            # For full content, browsers need Content-Length
             if content_length:
                 response_headers["Content-Length"] = content_length
-            else:
-                # If no content-length, we need to send it chunked
-                # FastAPI/Starlette will handle this with Transfer-Encoding: chunked
-                pass
         
         logger.info(f"✅ Streaming started (status: {status_code})")
         logger.info(f"📋 Headers: {response_headers}")
@@ -271,6 +249,96 @@ async def proxy(request: Request, url: str):
             except:
                 pass
         raise HTTPException(500, f"Proxy error: {str(e)}")
+
+# ==================== ENDPOINTS ====================
+@app.get("/")
+async def root():
+    """Simple HTML video player for easy testing"""
+    html_content = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>MovieBox Proxy Player</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+            body {
+                margin: 0;
+                background: #000;
+                display: flex;
+                flex-direction: column;
+                justify-content: center;
+                align-items: center;
+                height: 100vh;
+                font-family: Arial, sans-serif;
+                color: white;
+            }
+            video {
+                max-width: 100%;
+                max-height: 80vh;
+                background: #000;
+            }
+            .info {
+                margin-top: 20px;
+                font-size: 14px;
+                opacity: 0.7;
+                text-align: center;
+                padding: 0 20px;
+            }
+            .info a {
+                color: #4CAF50;
+                text-decoration: none;
+            }
+        </style>
+    </head>
+    <body>
+        <video controls autoplay>
+            <source src="" type="video/mp4" id="videoSource">
+            Your browser does not support the video tag.
+        </video>
+        <div class="info">
+            <p>Use <code>/play/ENCODED_URL</code> for native player</p>
+            <p>Example: <a href="#" id="exampleLink">/play/https%3A%2F%2Fexample.com%2Fvideo.mp4</a></p>
+        </div>
+        <script>
+            // Get video URL from query parameter or use default example
+            const urlParams = new URLSearchParams(window.location.search);
+            let videoUrl = urlParams.get('url');
+            
+            if (videoUrl) {
+                document.getElementById('videoSource').src = '/play/' + encodeURIComponent(videoUrl);
+                document.querySelector('video').load();
+            } else {
+                // Show example link
+                const exampleUrl = 'https%3A%2F%2Fbcdnxw.hakunaymatata.com%2Fbt%2F610a2ec52137bb1340e42c9ce19fd736.mp4%3Fsign%3Dd4cd9bc4931b9c8819cdf2d8a3db6d88%26t%3D1788554194';
+                document.getElementById('exampleLink').href = '/play/' + exampleUrl;
+                document.getElementById('exampleLink').textContent = '/play/' + exampleUrl;
+            }
+        </script>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
+@app.get("/proxy")
+async def proxy(request: Request, url: str):
+    """Legacy proxy endpoint - kept for backward compatibility"""
+    if not url:
+        raise HTTPException(400, "Missing url parameter")
+    
+    decoded_url = unquote(url)
+    return await proxy_video(request, decoded_url, is_play_endpoint=False)
+
+@app.get("/play/{encoded_url:path}")
+async def play_video(request: Request, encoded_url: str):
+    """
+    Video playback endpoint - browser will open native player
+    Usage: /play/ENCODED_URL
+    """
+    if not encoded_url:
+        raise HTTPException(400, "Missing url parameter")
+    
+    decoded_url = unquote(encoded_url)
+    return await proxy_video(request, decoded_url, is_play_endpoint=True)
 
 @app.on_event("shutdown")
 async def shutdown():
